@@ -16,21 +16,22 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/
 
 
 def _openai_compat(prompt: str, retries: int = 3) -> str:
-    """Thử lần lượt các model trong LLM_MODEL (phân cách dấu phẩy).
+    """Thử lần lượt từng key (LLM_API_KEY, phân cách dấu phẩy) x từng model (LLM_MODEL).
 
-    Groq tính quota TPM riêng từng model, nên model này bị 429 thì đổi model khác ngay.
+    Groq tính quota theo từng tài khoản (organization) và từng model, nên bị 429 thì đổi ngay sang cặp key/model kế tiếp.
     Tất cả đều 429 thì chờ retry-after ngắn nhất (giây) rồi thử lại; phải chờ quá 30s (thường là hết quota ngày) thì raise.
     """
     waits = []
-    for model in LLM_MODEL.split(","):
-        try:
-            return _post(prompt, model.strip())
-        except urllib.error.HTTPError as e:
-            if e.code != 429:
-                raise
-            waits.append(_retry_seconds(e.headers))
+    for key in LLM_KEY.split(","):
+        for model in LLM_MODEL.split(","):
+            try:
+                return _post(prompt, model.strip(), key.strip())
+            except urllib.error.HTTPError as e:
+                if e.code != 429:
+                    raise
+                waits.append(_retry_seconds(e.headers))
     if retries == 0 or min(waits) > 30:
-        raise RuntimeError(f"Tất cả model {LLM_MODEL} đều bị rate limit (retry-after {min(waits)}s)")
+        raise RuntimeError(f"Tất cả key/model ({LLM_MODEL}) đều bị rate limit (retry-after {min(waits)}s)")
     time.sleep(min(waits))
     return _openai_compat(prompt, retries - 1)
 
@@ -44,13 +45,13 @@ def _retry_seconds(headers) -> float:
     return sum(float(n) * units[u] for n, u in re.findall(r"([\d.]+)(ms|h|m|s)", reset)) or 5.0
 
 
-def _post(prompt: str, model: str) -> str:
+def _post(prompt: str, model: str, key: str) -> str:
     req = urllib.request.Request(
         f"{LLM_URL}/chat/completions",
         # temperature thấp: SQL/phân loại ổn định giữa các lần chạy
         data=json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}).encode(),
         # Groq chặn User-Agent mặc định của urllib (403), nên đặt tên client chung chung
-        headers={"Authorization": f"Bearer {LLM_KEY}", "Content-Type": "application/json", "User-Agent": "afis/1.0"},
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "afis/1.0"},
     )
     with urllib.request.urlopen(req, timeout=60) as r:
         text = json.load(r)["choices"][0]["message"]["content"] or ""

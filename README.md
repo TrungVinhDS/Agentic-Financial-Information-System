@@ -12,7 +12,7 @@ Chỉ cần cài [Docker Desktop](https://www.docker.com/products/docker-desktop
 ```bash
 # 1. Tạo file .env và điền key Groq miễn phí (https://console.groq.com/keys)
 cp .env.example .env          # Windows PowerShell: copy .env.example .env
-#    mở .env, điền: LLM_API_KEY=gsk_...
+#    mở .env, điền: LLM_API_KEY=gsk_...   (nhiều key khác tài khoản: gsk_a,gsk_b — tự xoay vòng khi bị giới hạn)
 
 # 2. Chạy
 docker compose up -d --build
