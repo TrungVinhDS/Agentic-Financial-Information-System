@@ -9,6 +9,7 @@ Module này thực hiện:
 
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
+from functools import lru_cache
 import re
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -309,7 +310,22 @@ def build_params(
         if ":window_days" in sql_text:
             params["window_days"] = 180  # ~6 tháng
 
+    # ========== FALLBACK CHO :company ==========
+    # Các regex trên chỉ bắt được câu tiếng Anh ("X of Apple", "Apple stock"...).
+    # Đã biết ticker thì lấy tên chính thức trong bảng companies (AAPL -> "Apple Inc.")
+    # để SQL kiểu `name ILIKE '%' || :company || '%'` luôn khớp, kể cả câu tiếng Việt.
+    if "company" not in params and params.get("ticker"):
+        name = _company_name(params["ticker"])
+        if name:
+            params["company"] = name
+
     return params
+
+
+@lru_cache(maxsize=64)
+def _company_name(ticker: str) -> Optional[str]:
+    with ENGINE.connect() as conn:
+        return conn.execute(text("SELECT name FROM companies WHERE symbol = :t"), {"t": ticker}).scalar()
 
 
 def run_sql(sql: str, params: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
