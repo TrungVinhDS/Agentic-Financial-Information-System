@@ -35,7 +35,10 @@ def _standalone_question(question: str, history: Any) -> str:
     prompt = (
         "Lịch sử hội thoại:\n" + "\n".join(turns) + f"\n\nCâu hỏi mới: {question}\n\n"
         "Viết lại câu hỏi mới thành MỘT câu hỏi độc lập, đầy đủ thông tin (tên công ty, chỉ số, khoảng thời gian) "
-        "lấy từ lịch sử nếu câu hỏi mới đang nói tiếp. Giữ nguyên ngôn ngữ của câu hỏi mới. "
+        "lấy từ lịch sử nếu câu hỏi mới đang nói tiếp. "
+        "Nếu câu hỏi mới chỉ đổi đối tượng hoặc khoảng thời gian thì GIỮ NGUYÊN ý định của câu hỏi trước của người dùng "
+        "(ví dụ: vẽ biểu đồ, so sánh, tính trung bình, cao nhất/thấp nhất) và giữ cách diễn đạt gần với câu đó. "
+        "Giữ nguyên ngôn ngữ của câu hỏi mới. Kết quả phải là câu hỏi hoặc yêu cầu hoàn chỉnh. "
         "Nếu câu hỏi mới đã đầy đủ hoặc không liên quan đến lịch sử, trả lại nguyên văn. "
         "Chỉ trả về câu hỏi, không giải thích."
     )

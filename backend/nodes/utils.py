@@ -222,6 +222,13 @@ def extract_date_range(question: str) -> Tuple[Optional[str], Optional[str]]:
         "dec": "12",
         "december": "12",
     }
+    # Tiếng Việt: "từ ngày 1 tháng 3 năm 2025 đến ngày 31 tháng 3 năm 2025", "từ 1/3/2025 đến 31/3/2025"
+    vn_dates = [
+        f"{y}-{int(mo):02d}-{int(d):02d}"
+        for d, mo, y in re.findall(r"(?:ngày\s+)?(\d{1,2})\s*(?:tháng\s+|/)(\d{1,2})\s*(?:năm\s+|/)(\d{4})", q, re.I)
+    ]
+    if len(vn_dates) >= 2:
+        return vn_dates[0], vn_dates[1]
     month_regex = r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
     # Pattern: "Month Day to Month Day, Year"
     m = re.search(
@@ -403,4 +410,7 @@ if __name__ == "__main__":
     assert extract_date_parts("Giá đóng cửa ngày 15 tháng 3 năm 2024") == {"date": "2024-03-15", "year": "2024", "month": "03"}
     assert extract_date_parts("average close in March 2025") == {"year": "2025", "month": "03"}
     assert extract_date_parts("năm 2025") == {"year": "2025"}
+    assert extract_date_range("Vẽ biểu đồ giá Nvidia từ ngày 1 tháng 3 năm 2025 đến ngày 31 tháng 3 năm 2025") == ("2025-03-01", "2025-03-31")
+    assert extract_date_range("giá Apple từ 1/3/2025 đến 31/3/2025") == ("2025-03-01", "2025-03-31")
+    assert extract_date_range("from January 1, 2025 to June 30, 2025") == ("2025-01-01", "2025-06-30")
     print("ok")

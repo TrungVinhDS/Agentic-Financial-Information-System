@@ -10,6 +10,7 @@ Module này thực hiện:
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 from functools import lru_cache
+import calendar
 import re
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -243,6 +244,12 @@ def build_params(
         params["year"] = parts["year"]
     if "month" in parts:
         params["month"] = parts["month"]
+    # Chỉ nói "tháng 3 năm 2025" / "March 2025" mà không có khoảng ngày: lấy trọn tháng đó
+    # (SQL do LLM sinh hay dùng :start_date/:end_date cho câu kiểu "riêng tháng 3 thôi")
+    if not start_date and "month" in parts and "year" in parts and "date" not in parts:
+        y, mth = int(parts["year"]), int(parts["month"])
+        start_date = f"{y}-{mth:02d}-01"
+        end_date = f"{y}-{mth:02d}-{calendar.monthrange(y, mth)[1]:02d}"
     if start_date:
         params["start_date"] = start_date
     if end_date:
