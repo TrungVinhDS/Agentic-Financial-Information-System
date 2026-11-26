@@ -5,13 +5,34 @@
 Ứng dụng AI chatbot thông minh giúp bạn tra cứu và phân tích dữ liệu của 30 công ty trong chỉ số Dow Jones Industrial Average (DJIA) chỉ bằng cách đặt câu hỏi tự nhiên. 
 ---
 
+## Chạy Nhanh Bằng Docker (khuyên dùng)
+
+Chỉ cần cài [Docker Desktop](https://www.docker.com/products/docker-desktop/). Toàn bộ dữ liệu (CSV giá + thông tin 30 công ty, PDF, ChromaDB đã index, model embedding) đã nằm sẵn trong project/image.
+
+```bash
+# 1. Tạo file .env và điền key Groq miễn phí (https://console.groq.com/keys)
+cp .env.example .env          # Windows PowerShell: copy .env.example .env
+#    mở .env, điền: LLM_API_KEY=gsk_...
+
+# 2. Chạy
+docker compose up -d --build
+```
+
+Lần đầu mất vài phút để build image. Sau đó mở **http://localhost:5173**.
+Thiếu key thì lệnh `docker compose up` sẽ dừng và báo lỗi ngay.
+
+- Xem log: `docker compose logs -f backend`
+- Dừng: `docker compose down` (thêm `-v` nếu muốn xóa luôn database và lịch sử chat)
+
+---
+
 ## Tính Năng Nổi Bật
 
 ### Hỏi Đáp Thông Minh
 - **Tiếng Việt & Tiếng Anh**: "Giá đóng cửa của Apple vào ngày XX?" hoặc "What was Microsoft's closing price?"
 - **Tự động hiểu ý**: Nhận biết tên công ty, ngày tháng, loại dữ liệu cần tra
 - **Mẫu SQL tích hợp**: Trả lời nhanh các câu hỏi phổ biến
-- **AI sinh SQL tự động**: Xử lý câu hỏi phức tạp bằng Gemini AI
+- **AI sinh SQL tự động**: Xử lý câu hỏi phức tạp bằng LLM (gpt-oss-120b qua Groq)
 
 ### Vẽ Biểu Đồ Tự Động
 Chỉ cần nói "vẽ biểu đồ" hoặc "plot" là có ngay biểu đồ tương tác:
@@ -31,7 +52,7 @@ Chỉ cần nói "vẽ biểu đồ" hoặc "plot" là có ngay biểu đồ tư
 ---
 
 ### API Key (Miễn Phí)
-- **Google Gemini API**: Đăng ký miễn phí tại [Google AI Studio](https://aistudio.google.com/app/apikey)
+- **Groq API**: Đăng ký miễn phí tại [Groq Console](https://console.groq.com/keys)
 
 ---
 
@@ -45,10 +66,8 @@ Chỉ cần nói "vẽ biểu đồ" hoặc "plot" là có ngay biểu đồ tư
 
 ### Bước 1: Tải Code
 ```bash
-# Clone repository
-git clone https://github.com/TrungVinn/Agentic-Financial-Information-System.git
+# Giải nén file ZIP của project rồi mở terminal tại thư mục vừa giải nén
 cd Agentic-Financial-Information-System
-# Hoặc tải file ZIP và giải nén
 ```
 
 ### Bước 2: Cài Đặt Backend (Django)
@@ -75,9 +94,8 @@ pip install -r requirements.txt
    Tạo file `.env` trong thư mục gốc của project:
 
    ```env
-   # Google Gemini API Key
-   GEMINI_API_KEY=your_gemini_api_key_here
-   GOOGLE_API_KEY=your_gemini_api_key_here
+   # Groq API Key
+   LLM_API_KEY=your_groq_api_key_here
 
    # PostgreSQL Database Configuration
    POSTGRES_HOST=localhost
@@ -88,9 +106,9 @@ pip install -r requirements.txt
    ```
 
    **Lấy API Key miễn phí:**
-   - Truy cập: https://aistudio.google.com/app/apikey
-   - Đăng nhập bằng tài khoản Google
-   - Nhấn "Create API Key" và copy key vào file `.env`
+   - Truy cập: https://console.groq.com/keys
+   - Đăng nhập (Google/GitHub/email)
+   - Nhấn "Create API Key" và copy key vào file `.env` (biến `LLM_API_KEY`)
 
 4. **Khởi tạo Database:**
 
@@ -231,7 +249,7 @@ Frontend sẽ chạy tại: **http://localhost:5173**
 ## Dữ Liệu Có Sẵn
 
 ### 30 Công Ty DJIA
-Apple (AAPL), Microsoft (MSFT), Boeing (BA), Coca-Cola (KO), Disney (DIS), Goldman Sachs (GS), IBM (IBM), Intel (INTC), JPMorgan (JPM), Johnson & Johnson (JNJ), McDonald's (MCD), Nike (NKE), Visa (V), Walmart (WMT), và 16 công ty khác.
+Thành phần DJIA hiện hành: Apple (AAPL), Amgen (AMGN), Amazon (AMZN), American Express (AXP), Boeing (BA), Caterpillar (CAT), Salesforce (CRM), Cisco (CSCO), Chevron (CVX), Disney (DIS), Goldman Sachs (GS), Home Depot (HD), Honeywell (HON), IBM (IBM), Johnson & Johnson (JNJ), JPMorgan (JPM), Coca-Cola (KO), McDonald's (MCD), 3M (MMM), Merck (MRK), Microsoft (MSFT), Nike (NKE), NVIDIA (NVDA), Procter & Gamble (PG), Sherwin-Williams (SHW), Travelers (TRV), UnitedHealth (UNH), Visa (V), Verizon (VZ), Walmart (WMT).
 
 ### Thông Tin Công Ty
 - Tên và mã cổ phiếu (ticker)
@@ -250,7 +268,7 @@ Apple (AAPL), Microsoft (MSFT), Boeing (BA), Coca-Cola (KO), Disney (DIS), Goldm
 - Cổ tức (dividends)
 - Tỷ lệ chia tách cổ phiếu (stock splits)
 
-**Khoảng thời gian:** Dữ liệu lịch sử từ 2020 đến 2025
+**Khoảng thời gian:** Dữ liệu giao dịch theo ngày từ 01/2023 đến 11/2026 (tải lại bằng `backend/data/download_djia.py`)
 
 ---
 

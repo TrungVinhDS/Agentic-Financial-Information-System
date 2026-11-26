@@ -10,11 +10,15 @@ Module này thực hiện:
 from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 import re
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import pandas as pd
 from sqlalchemy import create_engine, text
-from config import DB_CONNECTION_STRING, POSTGRES_CONFIG
+from config import DB_CONNECTION_STRING
+
+# Một engine dùng chung (có connection pool) thay vì tạo/hủy engine cho mỗi câu SQL.
+# Read-only: SQL do LLM sinh hoặc người dùng tự gõ không thể sửa/xóa dữ liệu.
+ENGINE = create_engine(
+    DB_CONNECTION_STRING, execution_options={"postgresql_readonly": True}
+)
 from nodes.utils import (
     normalize_text,
     extract_date_parts,
@@ -163,8 +167,6 @@ def build_params(
     # Ví dụ: "Goldman Sachs stock", "Microsoft stock", "stock of Apple", "Apple's stock"
     # Mục đích: Khi LLM sinh SQL với :company nhưng chưa có company trong params
     if "company" not in params:
-        q_normalized = normalize_text(question)
-        
         # Pattern 1: "{company} stock" hoặc "{company}'s stock"
         # Ví dụ: "Goldman Sachs stock", "Microsoft stock", "Apple's stock"
         stock_patterns = [
@@ -298,19 +300,6 @@ def build_params(
                 params["ticker_b"] = t2
                 break  # Tìm thấy rồi thì dừng
 
-    # ========== XỬ LÝ CHART PARAMETERS ==========
-    # Nếu cần vẽ biểu đồ, có thể có thêm parameters về date range
-    chart_request = (
-        (state or {}).get("chart_request") if isinstance(state, dict) else None
-    )
-    if chart_request:
-        if chart_request.get("start_date"):
-            params["start_date"] = chart_request["start_date"]
-        if chart_request.get("end_date"):
-            params["end_date"] = chart_request["end_date"]
-        if chart_request.get("use_recent_window"):
-            params["window_days"] = int(chart_request.get("window_days", 180))
-
     # ========== FALLBACK CHO :window_days ==========
     # Nếu SQL có parameter :window_days nhưng chưa được set,
     # dùng giá trị mặc định 180 ngày
@@ -352,59 +341,51 @@ def run_sql(sql: str, params: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
     Raises:
         psycopg2.Error: Nếu SQL không hợp lệ hoặc lỗi database
     """
-    # SQL samples/LLM output đã ở dạng PostgreSQL nên chỉ cần dùng trực tiếp
-    pg_sql = sql
+    # ========== TẠO SQL HIỂN THỊ ==========
+    # Thay :param và %(param)s bằng giá trị thực để show cho user
+    # KHÔNG dùng SQL này để execute (dùng SQL gốc với params để tránh SQL injection)
+    # :param::type (cast kiểu Postgres) làm SQLAlchemy không nhận ra bind param → đổi sang CAST(:param AS type)
+    sql = re.sub(r"(?<!:):(\w+)::(\w+)", r"CAST(:\1 AS \2)", sql)
+    display_sql = sql
 
-    # Kết nối đến PostgreSQL database
-    engine = create_engine(DB_CONNECTION_STRING)
+    # Sắp xếp params theo độ dài để tránh thay thế sai (thay thế param dài trước)
+    sorted_params = sorted(params.items(), key=lambda x: len(x[0]), reverse=True)
 
-    try:
-        # ========== TẠO SQL HIỂN THỊ ==========
-        # Thay :param và %(param)s bằng giá trị thực để show cho user
-        # KHÔNG dùng SQL này để execute (dùng SQL gốc với params để tránh SQL injection)
-        display_sql = pg_sql
+    for param_name, param_value in sorted_params:
+        # Format giá trị để hiển thị
+        if isinstance(param_value, str):
+            # String parameters cần có dấu nháy
+            formatted_value = f"'{param_value}'"
+        elif param_value is None:
+            formatted_value = "NULL"
+        else:
+            # Số không cần dấu nháy
+            formatted_value = str(param_value)
 
-        # Sắp xếp params theo độ dài để tránh thay thế sai (thay thế param dài trước)
-        sorted_params = sorted(params.items(), key=lambda x: len(x[0]), reverse=True)
+        # Thay thế cả :param và %(param)s
+        # Dùng regex để tránh thay thế nhầm (ví dụ :ticker trong :ticker_a)
+        # Pattern: :param_name không phải là phần của từ khác
+        pattern1 = r":\b" + re.escape(param_name) + r"\b"
+        display_sql = re.sub(pattern1, formatted_value, display_sql)
+        # Pattern: %(param_name)s
+        pattern2 = r"%\(" + re.escape(param_name) + r"\)s"
+        display_sql = re.sub(pattern2, formatted_value, display_sql)
 
-        for param_name, param_value in sorted_params:
-            # Format giá trị để hiển thị
-            if isinstance(param_value, str):
-                # String parameters cần có dấu nháy
-                formatted_value = f"'{param_value}'"
-            elif param_value is None:
-                formatted_value = "NULL"
-            else:
-                # Số không cần dấu nháy
-                formatted_value = str(param_value)
+    # Loại bỏ comment lines để SQL hiển thị gọn gàng
+    display_sql = "\n".join(
+        [
+            line
+            for line in display_sql.splitlines()
+            if not line.strip().startswith("--")
+        ]
+    ).strip()
 
-            # Thay thế cả :param và %(param)s
-            # Dùng regex để tránh thay thế nhầm (ví dụ :ticker trong :ticker_a)
-            # Pattern: :param_name không phải là phần của từ khác
-            pattern1 = r":\b" + re.escape(param_name) + r"\b"
-            display_sql = re.sub(pattern1, formatted_value, display_sql)
-            # Pattern: %(param_name)s
-            pattern2 = r"%\(" + re.escape(param_name) + r"\)s"
-            display_sql = re.sub(pattern2, formatted_value, display_sql)
+    # ========== THỰC THI SQL ==========
+    # Dùng SQL đã convert với bind parameters (an toàn, tránh SQL injection)
+    with ENGINE.connect() as conn:
+        df = pd.read_sql_query(text(sql), conn, params=params)
 
-        # Loại bỏ comment lines để SQL hiển thị gọn gàng
-        display_sql = "\n".join(
-            [
-                line
-                for line in display_sql.splitlines()
-                if not line.strip().startswith("--")
-            ]
-        ).strip()
-
-        # ========== THỰC THI SQL ==========
-        # Dùng SQL đã convert với bind parameters (an toàn, tránh SQL injection)
-        with engine.connect() as conn:
-            df = pd.read_sql_query(text(pg_sql), conn, params=params)
-
-        return df, display_sql
-
-    finally:
-        engine.dispose()
+    return df, display_sql
 
 
 def execute_sql(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -440,50 +421,6 @@ def execute_sql(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Build parameters từ câu hỏi
     params = build_params(question, ticker, state)
-
-    # ========== KIỂM TRA VÀ BỔ SUNG PARAMETER :company NẾU THIẾU ==========
-    # Nếu SQL có :company nhưng params không có company, thử extract lại từ câu hỏi
-    if re.search(r":company\b", sql, re.IGNORECASE) and "company" not in params:
-        # Thử extract lại với các pattern bổ sung
-        q_normalized = normalize_text(question)
-        
-        # Pattern: "{company} stock" hoặc "{company}'s stock"
-        stock_patterns = [
-            r"([A-Z][A-Za-z\s&,\.'-]+?)\s+(?:stock|shares)",
-            r"([A-Z][A-Za-z\s&,\.'-]+?)'s\s+(?:stock|shares)",
-        ]
-        for pattern in stock_patterns:
-            match = re.search(pattern, question, re.IGNORECASE)
-            if match:
-                company_name = match.group(1).strip().rstrip("?.,!")
-                words = company_name.split()
-                stop_words = {"the", "of", "from", "to", "during", "in", "on", "at", "for", "what", "was", "is", "are", "were"}
-                while words and words[0].lower() in stop_words:
-                    words = words[1:]
-                if words:
-                    company_name = " ".join(words[:4])
-                    if company_name and len(company_name) > 2:
-                        params["company"] = company_name
-                        break
-        
-        # Pattern: "stock of {company}" hoặc "shares of {company}"
-        if "company" not in params:
-            of_patterns = [
-                r"(?:stock|shares)\s+of\s+([A-Z][A-Za-z\s&,\.'-]+?)(?:\s+from|\s+to|\s+during|\s+in|\s+on|\s+from|\?|$)",
-            ]
-            for pattern in of_patterns:
-                match = re.search(pattern, question, re.IGNORECASE)
-                if match:
-                    company_name = match.group(1).strip().rstrip("?.,!")
-                    words = company_name.split()
-                    stop_words = {"the", "of", "from", "to", "during", "in", "on", "at", "for", "stock", "shares"}
-                    while words and words[-1].lower() in stop_words:
-                        words = words[:-1]
-                    if words:
-                        company_name = " ".join(words[:4])
-                        if company_name and len(company_name) > 2:
-                            params["company"] = company_name
-                            break
 
     try:
         # Thực thi SQL

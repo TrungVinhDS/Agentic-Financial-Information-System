@@ -1,9 +1,7 @@
 import re
 from typing import Dict, Any, Optional, Tuple, List
 import pandas as pd
-from config import SQL_SAMPLES_FILE, DJIA_COMPANIES_CSV
-
-COMPANY_ALIASES: Dict[str, str] = {}
+from config import DJIA_COMPANIES_CSV
 
 
 def _canonicalize_company_name(name: str) -> str:
@@ -43,8 +41,10 @@ def load_company_aliases() -> Dict[str, str]:
         "verizon": "VZ",
         "unitedhealth": "UNH",
         "unitedhealth group": "UNH",
-        "walgreens": "WBA",
-        "walgreens boots alliance": "WBA",
+        "amazon": "AMZN",
+        "nvidia": "NVDA",
+        "sherwin-williams": "SHW",
+        "sherwin williams": "SHW",
         "chevron": "CVX",
         "american express": "AXP",
         "amgen": "AMGN",
@@ -57,7 +57,6 @@ def load_company_aliases() -> Dict[str, str]:
         "jp morgan": "JPM",
         "johnson & johnson": "JNJ",
         "home depot": "HD",
-        "dow": "DOW",
         "salesforce": "CRM",
         "cisco": "CSCO",
         "visa": "V",
@@ -70,27 +69,19 @@ def load_company_aliases() -> Dict[str, str]:
         "3m": "MMM",
         "goldman sachs": "GS",
     }
-    for k, v in manual.items():
-        aliases[k] = v
-
+    aliases.update(manual)
     return aliases
 
 
-COMPANY_ALIASES = load_company_aliases()
-
-
 def normalize_text(text: str) -> str:
-    # Normalize whitespace và lowercase
-    normalized = re.sub(r"\s+", " ", text.strip().lower())
-    # Normalize dấu nháy đơn: thay tất cả các loại dấu nháy đơn (curly) bằng straight quote
-    normalized = (
-        normalized.replace("\u2019", "'")
-        .replace("\u2018", "'")
-        .replace("\u201B", "'")
-        .replace("’", "'")
-        .replace("‘", "'")
+    """Lowercase, gộp khoảng trắng, đổi nháy cong thành nháy thẳng."""
+    return re.sub(r"\s+", " ", text.strip().lower()).translate(
+        {0x2019: "'", 0x2018: "'", 0x201B: "'"}
     )
-    return normalized
+
+
+# Key đã normalize sẵn để extract_ticker không phải normalize lại từng alias mỗi câu hỏi
+COMPANY_ALIASES = {normalize_text(k): v for k, v in load_company_aliases().items()}
 
 
 def extract_ticker(question: str) -> Optional[str]:
@@ -124,26 +115,8 @@ def extract_ticker(question: str) -> Optional[str]:
 
     # Tìm ticker từ alias trước (ưu tiên hơn)
     for name, ticker in COMPANY_ALIASES.items():
-        # Normalize dấu nháy đơn trong alias để match với câu hỏi đã normalize
-        # (câu hỏi đã được normalize với straight quote U+0027)
-        # Thay thế tất cả các loại dấu nháy đơn (curly U+2019, straight U+0027) bằng straight quote
-        normalized_alias = name
-        # Unicode normalize: thay curly quotes bằng straight quote
-        normalized_alias = normalized_alias.replace(
-            "\u2019", "'"
-        )  # Right single quotation mark
-        normalized_alias = normalized_alias.replace(
-            "\u2018", "'"
-        )  # Left single quotation mark
-        normalized_alias = normalized_alias.replace(
-            "\u201B", "'"
-        )  # Single high-reversed-9 quotation mark
-        # Escape tên
-        escaped_name = re.escape(normalized_alias)
-        # Pattern: word boundary trước (hoặc không có ký tự word), tên, word boundary sau (hoặc không có ký tự word)
-        # Sử dụng negative lookbehind/lookahead để tránh match partial words
-        pattern = r"(?<!\w)" + escaped_name + r"(?!\w)"
-        if re.search(pattern, q, re.IGNORECASE):
+        # lookbehind/lookahead thay cho  để alias có ký tự đặc biệt (&, ') vẫn khớp nguyên từ
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", q):
             return ticker
 
     # Tìm ticker từ pattern (chỉ khi không có từ ignore)

@@ -29,7 +29,7 @@ POSTGRES_CONFIG = {
 
 # Connection string cho SQLAlchemy
 DB_CONNECTION_STRING = (
-    f"postgresql://{POSTGRES_CONFIG['user']}:{POSTGRES_CONFIG['password']}"
+    f"postgresql+psycopg2://{POSTGRES_CONFIG['user']}:{POSTGRES_CONFIG['password']}"
     f"@{POSTGRES_CONFIG['host']}:{POSTGRES_CONFIG['port']}/{POSTGRES_CONFIG['database']}"
 )
 
@@ -37,10 +37,10 @@ DB_CONNECTION_STRING = (
 # ==================== DỮ LIỆU ĐẦU VÀO ====================
 
 # File CSV chứa thông tin công ty (symbol, name, sector, industry...)
-DJIA_COMPANIES_CSV = DATA_DIR / "djia_companies_20251210.csv"
+DJIA_COMPANIES_CSV = DATA_DIR / "djia_companies.csv"
 
 # File CSV chứa dữ liệu giá cổ phiếu (date, open, high, low, close, volume...)
-DJIA_PRICES_CSV = DATA_DIR / "djia_prices_20251210.csv"
+DJIA_PRICES_CSV = DATA_DIR / "djia_prices.csv"
 
 # File chứa 80+ SQL templates mẫu
 # Được sử dụng bởi SQL Template Matcher để tìm SQL phù hợp với câu hỏi

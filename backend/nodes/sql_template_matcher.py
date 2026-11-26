@@ -1,35 +1,34 @@
 from typing import Dict, Any, Optional, List
 import re
-import os
-from dotenv import load_dotenv
-from google import generativeai as google_genai
+
 from config import SQL_SAMPLES_FILE
+from nodes.llm import ask
 from nodes.utils import normalize_text, extract_ticker
-from nodes.chart_generator import build_chart_sql
-
-# Load environment variables
-load_dotenv()
-
-# Setup Gemini API key
-if os.getenv("GOOGLE_API_KEY") in (None, "") and os.getenv("GEMINI_API_KEY"):
-    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
 
 def load_sql_samples() -> List[str]:
     """Load SQL samples từ file."""
     if not SQL_SAMPLES_FILE.exists():
         return []
-
     text = SQL_SAMPLES_FILE.read_text(encoding="utf-8")
-    statements = [s.strip() + ";" for s in re.split(r";\s*\n", text) if s.strip()]
-
-    return statements
+    return [s.strip() + ";" for s in re.split(r";\s*\n", text) if s.strip()]
 
 
-def validate_and_find_sql_with_llm(
-    question: str, sql_samples: List[str]
-) -> Optional[str]:
-    """Dùng LLM duy nhất để tìm SQL sample phù hợp. Nếu không có, trả về None."""
+def _top_samples(question: str, samples: List[str], k: int = 12) -> List[str]:
+    """Lọc k mẫu có nhiều từ trùng với câu hỏi nhất (so với dòng comment MẪU CÂU HỎI / EN).
+
+    Gửi cả ~100 mẫu (~13K token) vượt giới hạn 8K TPM của Groq free, nên lọc trước rồi mới hỏi LLM.
+    ponytail: đếm từ trùng đơn giản; đổi sang embedding nếu lọc sót mẫu đúng.
+    """
+    words = lambda s: set(re.findall(r"\w+", normalize_text(s)))
+    q = words(question)
+    comments = lambda s: " ".join(l for l in s.splitlines() if l.strip().startswith("--"))
+    return sorted(samples, key=lambda s: len(q & words(comments(s))), reverse=True)[:k]
+
+
+def match_sample(question: str) -> Optional[str]:
+    """Dùng LLM để chọn SQL sample phù hợp. Không có (hoặc LLM lỗi) thì trả về None."""
+    sql_samples = _top_samples(question, load_sql_samples())
     if not sql_samples:
         return None
 
@@ -56,51 +55,28 @@ CÁCH TRẢ LỜI:
 Chỉ trả lời: FOUND: n hoặc NO_MATCH."""
 
     try:
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            print("Warning: No Gemini API key found. Skipping SQL template matching.")
-            return None
-        
-        google_genai.configure(api_key=api_key)
-        model = google_genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt)
-        result = (response.text or "").strip()
-        if result.startswith("FOUND:"):
-            try:
-                idx_str = result.split(":")[1].strip()
-                idx = int(idx_str) - 1
-                if 0 <= idx < len(sql_samples):
-                    return sql_samples[idx]
-            except (ValueError, IndexError):
-                return None
-        elif result == "NO_MATCH":
-            return None
-        return None
+        m = re.match(r"FOUND:\s*(\d+)", ask(prompt))
     except Exception as e:
         print(f"LLM validation error: {e}")
         return None
-
-
-def match_sample(question: str) -> Optional[str]:
-    """Chỉ dựa vào LLM để tìm SQL sample phù hợp."""
-    sql_samples = load_sql_samples()
-    return validate_and_find_sql_with_llm(question, sql_samples)
+    idx = int(m.group(1)) - 1 if m else -1
+    return sql_samples[idx] if 0 <= idx < len(sql_samples) else None
 
 
 def match_sql_template(state: Dict[str, Any]) -> Dict[str, Any]:
     """Trích xuất ticker và tìm SQL template phù hợp với câu hỏi."""
     question = state.get("question", "")
-    needs_chart = state.get("needs_chart", False)
-    chart_request = state.get("chart_request")
-    chart_type = state.get("chart_type")
-    complexity = state.get("complexity", {})
-
-    # Trích xuất ticker (gộp logic từ alias_resolver)
     ticker = extract_ticker(question)
 
-    # Kiểm tra nếu câu hỏi về tất cả DJIA companies
+    # Câu hỏi vẽ biểu đồ: luôn để LLM sinh SQL (template chỉ trả về 1 giá trị, không đủ để vẽ)
+    if state.get("needs_chart"):
+        return {**state, "ticker": ticker, "sql": None, "used_sample": False}
+
+    # Câu hỏi về tất cả công ty: template đều theo :ticker nên cũng để LLM sinh SQL
     q = normalize_text(question)
-    is_all_companies = complexity.get("involves_multiple_companies", False) or any(
+    is_all_companies = state.get("complexity", {}).get(
+        "involves_multiple_companies", False
+    ) or any(
         phrase in q
         for phrase in [
             "all companies",
@@ -113,26 +89,8 @@ def match_sql_template(state: Dict[str, Any]) -> Dict[str, Any]:
             "for each djia",
         ]
     )
-
-    if needs_chart:
-        sql = build_chart_sql(question, chart_type, chart_request, ticker)
-        return {**state, "ticker": ticker, "sql": sql, "used_sample": False}
-
-    # Nếu câu hỏi về tất cả companies, force dùng LLM thay vì template
     if is_all_companies:
-        return {
-            **state,
-            "ticker": None,
-            "sql": None,
-            "used_sample": False,
-            "force_llm": True,
-        }
+        return {**state, "ticker": None, "sql": None, "used_sample": False}
 
-    if state.get("force_llm"):
-        return {**state, "ticker": ticker, "sql": None, "used_sample": False}
-
-    # Tìm SQL template (chỉ khi không phải all companies)
     sql = match_sample(question)
-    used_sample = sql is not None
-
-    return {**state, "ticker": ticker, "sql": sql, "used_sample": used_sample}
+    return {**state, "ticker": ticker, "sql": sql, "used_sample": sql is not None}

@@ -6,11 +6,9 @@ Module này là bước đầu tiên trong workflow, phân tích câu hỏi ngư
 2. Phát hiện yêu cầu vẽ biểu đồ và loại biểu đồ
 """
 
-from typing import Dict, Any, Optional, List
-import os
+from typing import Dict, Any
 import re
-import json
-from nodes.utils import normalize_text, extract_ticker
+from nodes.utils import normalize_text
 
 
 def detect_query_complexity(question: str, force_chart: bool = False) -> Dict[str, Any]:
@@ -54,7 +52,6 @@ def detect_query_complexity(question: str, force_chart: bool = False) -> Dict[st
     # Chỉ vẽ biểu đồ khi câu hỏi chứa từ "plot" hoặc "vẽ", hoặc khi force_chart = True
     chart_trigger_patterns = [r"\bplot\b", r"\bvẽ\b", r"\bve\b"]
     has_chart_trigger = any(re.search(pattern, q) for pattern in chart_trigger_patterns)
-    has_explicit_chart_request = has_chart_trigger or force_chart
 
     if has_chart_trigger or force_chart:
         complexity["needs_chart"] = True
@@ -79,16 +76,10 @@ def detect_query_complexity(question: str, force_chart: bool = False) -> Dict[st
         elif any(word in q for word in ["heatmap", "heat map", "ma trận", "ma tran"]):
             # Biểu đồ nhiệt (heatmap)
             complexity["chart_type"] = "heatmap"
-        elif (
-            any(word in q for word in ["volume", "khối lượng", "khoi luong"])
-            and has_explicit_chart_request
-        ):
+        elif any(word in q for word in ["volume", "khối lượng", "khoi luong"]):
             # Biểu đồ khối lượng giao dịch
             complexity["chart_type"] = "volume"
-        elif (
-            any(word in q for word in ["compare", "so sánh", "so sanh", "comparison"])
-            and has_explicit_chart_request
-        ):
+        elif any(word in q for word in ["compare", "so sánh", "so sanh", "comparison"]):
             # Biểu đồ so sánh nhiều cổ phiếu
             complexity["chart_type"] = "comparison"
         else:

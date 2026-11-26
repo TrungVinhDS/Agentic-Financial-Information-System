@@ -1,199 +1,123 @@
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Dict, List
 
 import pandas as pd
 import plotly.io as pio
 from django.contrib.auth import authenticate, login, logout, get_user_model
-from django.views.decorators.csrf import csrf_exempt
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from django.shortcuts import get_object_or_404
+from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from graphs.djia_graph import run_djia_graph
 from nodes.sql_executor import run_sql
 from .models import Conversation, Message
 
-
-def _normalize_value(val: Any) -> Any:
-    if isinstance(val, (pd.Timestamp, datetime, date)):
-        return val.isoformat()
-    return val
+# CSRF cho /api/ đã tắt ở api.middleware, quyền mặc định là AllowAny (core/settings.py)
+User = get_user_model()
 
 
 def _df_to_rows(df: pd.DataFrame, max_rows: int = 100) -> List[Dict[str, Any]]:
-    if df is None or df.empty:
+    if not isinstance(df, pd.DataFrame) or df.empty:
         return []
-    trimmed = df.head(max_rows).copy()
-    return trimmed.applymap(_normalize_value).to_dict(orient="records")
+    # pd.Timestamp/datetime đều là date -> isoformat; NaN -> None để JSON hợp lệ
+    rows = df.head(max_rows).map(lambda v: v.isoformat() if isinstance(v, date) else v)
+    return rows.astype(object).where(rows.notna(), None).to_dict(orient="records")
 
 
-@csrf_exempt
 @api_view(["POST"])
-@permission_classes([AllowAny])
 def djia_query(request):
     """
     Nhận câu hỏi tự nhiên, chạy multi-agent DJIA và trả về kết quả JSON cho FE.
+    Đã đăng nhập thì lưu hội thoại vào DB; chưa đăng nhập thì chỉ trả kết quả.
 
-    Body:
-        { "question": "..." }
+    Body: { "question": "...", "force_chart": bool, "conversation_id": "uuid" }
     """
     question = (request.data.get("question") or "").strip()
     if not question:
         return Response({"detail": "Thiếu trường 'question'."}, status=400)
 
-    # Kiểm tra force_chart flag từ frontend
-    force_chart = request.data.get("force_chart", False)
+    conversation = None
+    if request.user.is_authenticated:
+        conversation_id = request.data.get("conversation_id")
+        if conversation_id:
+            conversation = get_object_or_404(Conversation, id=conversation_id, user=request.user)
+        else:
+            conversation = Conversation.objects.create(user=request.user, title=question[:80])
+        Message.objects.create(conversation=conversation, role=Message.ROLE_USER, content=question)
 
-    user = request.user if request.user.is_authenticated else None
-
-    # ========== TRƯỜNG HỢP CHƯA ĐĂNG NHẬP: KHÔNG LƯU DB ==========
-    if user is None:
-        try:
-            result = run_djia_graph(question, force_chart=force_chart)
-        except Exception as e:
-            return Response(
-                {"success": False, "error": f"Lỗi nội bộ khi chạy agent: {e}"},
-                status=500,
-            )
-
-        df = result.get("df")
-        rows = _df_to_rows(df) if isinstance(df, pd.DataFrame) else []
-
-        chart = result.get("chart")
-        chart_json = None
-        if chart is not None:
-            try:
-                chart_json = pio.to_json(chart)
-            except Exception:
-                chart_json = None
-
-        payload: Dict[str, Any] = {
-            "success": bool(result.get("success")),
-            "answer": result.get("answer", ""),
-            "sql": result.get("actual_sql") or result.get("sql") or "",
-            "used_sample": bool(result.get("used_sample", False)),
-            "error": result.get("error"),
-            "rows": rows,
-            "workflow": result.get("workflow", []),
-            "complexity": result.get("complexity", {}),
-            "chart_json": chart_json,
-            "conversation_id": None,
-        }
-
-        return Response(payload)
-
-    # ========== ĐÃ ĐĂNG NHẬP: LƯU THEO USER ==========
-    conversation_id = request.data.get("conversation_id")
-    conversation: Conversation
-    if conversation_id:
-        try:
-            conversation = Conversation.objects.get(id=conversation_id, user=user)
-        except Conversation.DoesNotExist:
-            return Response({"detail": "Conversation không tồn tại."}, status=404)
-    else:
-        title = question[:80]
-        conversation = Conversation.objects.create(user=user, title=title)
-
-    # Lưu message của user
-    Message.objects.create(
-        conversation=conversation,
-        role=Message.ROLE_USER,
-        content=question,
-    )
-
-    # ========== CHẠY AGENT ==========
     try:
-        result = run_djia_graph(question, force_chart=force_chart)
+        result = run_djia_graph(question, force_chart=bool(request.data.get("force_chart")))
     except Exception as e:
-        Message.objects.create(
-            conversation=conversation,
-            role=Message.ROLE_ASSISTANT,
-            content=f"Lỗi nội bộ khi chạy agent: {e}",
-            error=str(e),
-        )
-        return Response(
-            {"success": False, "error": f"Lỗi nội bộ khi chạy agent: {e}"},
-            status=500,
-        )
+        error = f"Lỗi nội bộ khi chạy agent: {e}"
+        if conversation:
+            Message.objects.create(
+                conversation=conversation, role=Message.ROLE_ASSISTANT, content=error, error=str(e)
+            )
+        return Response({"success": False, "error": error}, status=500)
 
-    df = result.get("df")
-    rows = _df_to_rows(df) if isinstance(df, pd.DataFrame) else []
-
-    chart = result.get("chart")
     chart_json = None
-    if chart is not None:
+    if result.get("chart") is not None:
         try:
-            chart_json = pio.to_json(chart)
+            chart_json = pio.to_json(result["chart"])
         except Exception:
-            chart_json = None
+            pass
 
-    payload: Dict[str, Any] = {
+    payload = {
         "success": bool(result.get("success")),
         "answer": result.get("answer", ""),
-        "sql": result.get("actual_sql") or result.get("sql") or "",
-        "used_sample": bool(result.get("used_sample", False)),
+        "sql": result.get("sql") or "",
+        "used_sample": bool(result.get("used_sample")),
         "error": result.get("error"),
-        "rows": rows,
+        "rows": _df_to_rows(result.get("df")),
         "workflow": result.get("workflow", []),
         "complexity": result.get("complexity", {}),
         "chart_json": chart_json,
-        "conversation_id": str(conversation.id),
+        "conversation_id": str(conversation.id) if conversation else None,
     }
 
-    # Lưu message của assistant
-    Message.objects.create(
-        conversation=conversation,
-        role=Message.ROLE_ASSISTANT,
-        content=payload["answer"],
-        sql=payload["sql"],
-        used_sample=payload["used_sample"],
-        error=str(payload["error"] or ""),
-        rows_json=rows,
-        metadata={
-            "workflow": payload["workflow"],
-            "complexity": payload["complexity"],
-            "chart_json": chart_json,
-        },
-    )
+    if conversation:
+        Message.objects.create(
+            conversation=conversation,
+            role=Message.ROLE_ASSISTANT,
+            content=payload["answer"],
+            sql=payload["sql"],
+            used_sample=payload["used_sample"],
+            error=str(payload["error"] or ""),
+            rows_json=payload["rows"],
+            metadata={
+                "workflow": payload["workflow"],
+                "complexity": payload["complexity"],
+                "chart_json": chart_json,
+            },
+        )
 
     return Response(payload)
 
 
 @api_view(["GET"])
 def list_conversations(request):
-    """
-    Trả về danh sách các phiên chat (để FE hiển thị sidebar / lịch sử).
-    """
+    """Danh sách phiên chat của user (FE hiển thị ở sidebar)."""
     if not request.user.is_authenticated:
         return Response([])
-
-    conversations = Conversation.objects.filter(user=request.user)
-    data = [
-        {
-            "id": str(conv.id),
-            "title": conv.title,
-            "created_at": conv.created_at.isoformat(),
-            "updated_at": conv.updated_at.isoformat(),
-        }
-        for conv in conversations
-    ]
-    return Response(data)
+    return Response(
+        [
+            {
+                "id": str(conv.id),
+                "title": conv.title,
+                "created_at": conv.created_at.isoformat(),
+                "updated_at": conv.updated_at.isoformat(),
+            }
+            for conv in Conversation.objects.filter(user=request.user)
+        ]
+    )
 
 
 @api_view(["GET"])
 def conversation_messages(request, conversation_id: str):
-    """
-    Trả về toàn bộ message trong một phiên chat.
-    """
+    """Toàn bộ message trong một phiên chat."""
     if not request.user.is_authenticated:
         return Response({"detail": "Cần đăng nhập."}, status=401)
-
-    try:
-        conversation = Conversation.objects.get(id=conversation_id, user=request.user)
-    except Conversation.DoesNotExist:
-        return Response({"detail": "Conversation không tồn tại."}, status=404)
-
-    messages = conversation.messages.all()
+    conversation = get_object_or_404(Conversation, id=conversation_id, user=request.user)
     data = [
         {
             "id": msg.id,
@@ -206,130 +130,75 @@ def conversation_messages(request, conversation_id: str):
             "metadata": msg.metadata,
             "created_at": msg.created_at.isoformat(),
         }
-        for msg in messages
+        for msg in conversation.messages.all()
     ]
     return Response({"id": str(conversation.id), "title": conversation.title, "messages": data})
 
 
-@csrf_exempt
+@api_view(["DELETE"])
+def delete_conversation(request, conversation_id: str):
+    """Xóa một phiên chat (và toàn bộ messages thuộc nó) của user hiện tại."""
+    if not request.user.is_authenticated:
+        return Response({"detail": "Cần đăng nhập."}, status=401)
+    get_object_or_404(Conversation, id=conversation_id, user=request.user).delete()
+    return Response({"success": True})
+
+
+def _credentials(request):
+    return (request.data.get("username") or "").strip(), request.data.get("password") or ""
+
+
 @api_view(["POST"])
-@permission_classes([AllowAny])
 def login_view(request):
-    """
-    Đăng nhập sử dụng session Django.
-    """
-    username = (request.data.get("username") or "").strip()
-    password = request.data.get("password") or ""
+    """Đăng nhập sử dụng session Django."""
+    username, password = _credentials(request)
     if not username or not password:
         return Response({"detail": "Thiếu username hoặc password."}, status=400)
-
     user = authenticate(request, username=username, password=password)
     if user is None:
         return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
-
     login(request, user)
     return Response({"username": user.username})
 
 
-@csrf_exempt
 @api_view(["POST"])
-@permission_classes([AllowAny])
+def register_view(request):
+    """Đăng ký tài khoản mới (đơn giản: username + password)."""
+    username, password = _credentials(request)
+    if not username or not password:
+        return Response({"detail": "Thiếu username hoặc password."}, status=400)
+    if User.objects.filter(username=username).exists():
+        return Response({"detail": "Username đã tồn tại."}, status=400)
+    User.objects.create_user(username=username, password=password)
+    return Response({"username": username})
+
+
+@api_view(["POST"])
 def logout_view(request):
-    """
-    Đăng xuất khỏi session hiện tại.
-    """
-    if not request.user.is_authenticated:
-        return Response({"detail": "Chưa đăng nhập."}, status=400)
     logout(request)
     return Response({"success": True})
 
 
 @api_view(["GET"])
 def me_view(request):
-    """
-    Trả về thông tin user hiện tại (nếu đã đăng nhập).
-    """
+    """Thông tin user hiện tại (401 nếu chưa đăng nhập)."""
     if not request.user.is_authenticated:
         return Response({"detail": "Chưa đăng nhập."}, status=401)
     return Response({"username": request.user.username})
 
 
-User = get_user_model()
-
-
-@csrf_exempt
 @api_view(["POST"])
-@permission_classes([AllowAny])
-def register_view(request):
-    """
-    Đăng ký tài khoản mới (đơn giản: username + password).
-    """
-    username = (request.data.get("username") or "").strip()
-    password = request.data.get("password") or ""
-    if not username or not password:
-        return Response({"detail": "Thiếu username hoặc password."}, status=400)
-
-    if User.objects.filter(username=username).exists():
-        return Response({"detail": "Username đã tồn tại."}, status=400)
-
-    User.objects.create_user(username=username, password=password)
-    return Response({"username": username})
-
-
-@api_view(["DELETE"])
-def delete_conversation(request, conversation_id: str):
-    """
-    Xóa một phiên chat (và toàn bộ messages thuộc nó) của user hiện tại.
-    """
-    if not request.user.is_authenticated:
-        return Response({"detail": "Cần đăng nhập."}, status=401)
-
-    try:
-        conversation = Conversation.objects.get(id=conversation_id, user=request.user)
-    except Conversation.DoesNotExist:
-        return Response({"detail": "Conversation không tồn tại."}, status=404)
-
-    conversation.delete()
-    return Response({"success": True})
-
-
-@csrf_exempt
-@api_view(["POST"])
-@permission_classes([AllowAny])
 def execute_sql(request):
     """
-    Chạy SQL trực tiếp trên database (không qua LLM).
-    
-    Body:
-        { "sql": "SELECT * FROM prices WHERE ticker = 'AAPL' LIMIT 10" }
-    
-    Returns:
-        {
-            "success": true/false,
-            "rows": [...],
-            "sql": "SQL đã chạy",
-            "error": null hoặc error message
-        }
+    Chạy SQL trực tiếp trên database (không qua LLM). Kết nối read-only nên chỉ SELECT được.
+
+    Body: { "sql": "SELECT * FROM prices WHERE ticker = 'AAPL' LIMIT 10" }
     """
     sql = (request.data.get("sql") or "").strip()
     if not sql:
         return Response({"detail": "Thiếu trường 'sql'."}, status=400)
-    
     try:
-        # Chạy SQL trực tiếp (không có parameters)
         df, display_sql = run_sql(sql, {})
-        rows = _df_to_rows(df)
-        
-        return Response({
-            "success": True,
-            "rows": rows,
-            "sql": display_sql,
-            "error": None,
-        })
     except Exception as e:
-        return Response({
-            "success": False,
-            "rows": [],
-            "sql": sql,
-            "error": str(e),
-        }, status=500)
+        return Response({"success": False, "rows": [], "sql": sql, "error": str(e)}, status=500)
+    return Response({"success": True, "rows": _df_to_rows(df), "sql": display_sql, "error": None})

@@ -71,7 +71,7 @@ def build_djia_graph():
     1. plan_query: Phân tích câu hỏi SQL, xác định độ phức tạp
     2. rag_retrieve: Xử lý câu hỏi Other từ knowledge base (PDF)
     3. match_sql_template: Tìm SQL mẫu từ 80+ templates
-    4. generate_sql: Sinh SQL bằng Gemini AI (nếu không có mẫu)
+    4. generate_sql: Sinh SQL bằng LLM (nếu không có mẫu)
     5. execute_sql: Thực thi SQL trên PostgreSQL database
     6. generate_chart: Vẽ biểu đồ (nếu cần)
     7. summarize_answer: Tạo câu trả lời tự nhiên (SQL hoặc LLM general)
@@ -97,23 +97,11 @@ def build_djia_graph():
     # Start: Bắt đầu với classifier
     graph.set_entry_point("question_classifier")
 
-    # Step 0→1/2: Conditional - SQL-related hay Other?
-    def route_after_classify(state: Dict[str, Any]) -> str:
-        """
-        Quyết định routing sau khi phân loại.
-
-        Returns:
-            "plan_query" nếu là SQL-related (chuyển sang SQL pipeline)
-            "rag_retrieve" nếu là Other (chuyển sang RAG)
-        """
-        if state.get("is_sql_related", True):
-            return "plan_query"
-        return "rag_retrieve"
-
+    # Step 0→1/2: SQL-related → SQL pipeline, Other → RAG
     graph.add_conditional_edges(
         "question_classifier",
-        route_after_classify,
-        {"plan_query": "plan_query", "rag_retrieve": "rag_retrieve"},
+        lambda state: "plan_query" if state.get("is_sql_related", True) else "rag_retrieve",
+        ["plan_query", "rag_retrieve"],
     )
 
     # Step 1→3: SQL pipeline - Sau planning → SQL template matching
@@ -123,45 +111,21 @@ def build_djia_graph():
     # (answer_summarizer sẽ quyết định dùng RAG context hay LLM general)
     graph.add_edge("rag_retrieve", "summarize_answer")
 
-    # Step 3→4/5: Conditional - Có SQL mẫu hay không?
-    def need_llm(state: Dict[str, Any]) -> str:
-        """
-        Quyết định có cần gọi LLM để sinh SQL không.
-
-        Returns:
-            "generate_sql" nếu chưa có SQL (không tìm thấy mẫu)
-            "execute_sql" nếu đã có SQL từ template
-        """
-        return "generate_sql" if not state.get("sql") else "execute_sql"
-
+    # Step 3→4/5: Không tìm thấy SQL mẫu → gọi LLM sinh SQL
     graph.add_conditional_edges(
         "match_sql_template",
-        need_llm,
-        {"generate_sql": "generate_sql", "execute_sql": "execute_sql"},
+        lambda state: "execute_sql" if state.get("sql") else "generate_sql",
+        ["generate_sql", "execute_sql"],
     )
 
     # Step 4→5: Sau generate SQL → execute
     graph.add_edge("generate_sql", "execute_sql")
 
-    # Step 5→6/7: Conditional - Có cần vẽ biểu đồ không?
-    def need_chart(state: Dict[str, Any]) -> str:
-        """
-        Quyết định có cần vẽ biểu đồ không.
-
-        Dựa trên flag "needs_chart" được set bởi planner.
-
-        Returns:
-            "generate_chart" nếu cần vẽ biểu đồ
-            "summarize_answer" nếu không cần
-        """
-        return (
-            "generate_chart" if state.get("needs_chart", False) else "summarize_answer"
-        )
-
+    # Step 5→6/7: Vẽ biểu đồ nếu planner đã set needs_chart
     graph.add_conditional_edges(
         "execute_sql",
-        need_chart,
-        {"generate_chart": "generate_chart", "summarize_answer": "summarize_answer"},
+        lambda state: "generate_chart" if state.get("needs_chart") else "summarize_answer",
+        ["generate_chart", "summarize_answer"],
     )
 
     # Step 6→7: Sau vẽ biểu đồ → summarize
@@ -174,15 +138,18 @@ def build_djia_graph():
     return graph.compile()
 
 
+# Compile một lần khi import, dùng lại cho mọi request
+APP = build_djia_graph()
+
+
 def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
     """
     Entry point chính để chạy workflow DJIA.
 
     Hàm này:
-    1. Build workflow graph
-    2. Invoke với câu hỏi từ user
-    3. Track workflow steps để debug
-    4. Trả về kết quả cuối cùng với metadata
+    1. Invoke workflow với câu hỏi từ user
+    2. Track workflow steps để debug
+    3. Trả về kết quả cuối cùng với metadata
 
     Args:
         question: Câu hỏi từ người dùng (tiếng Việt hoặc tiếng Anh)
@@ -213,9 +180,6 @@ def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
         >>> result = run_djia_graph("Vẽ biểu đồ giá Apple trong Q1 2024")
         >>> result['chart']  # Plotly figure object
     """
-    # Build và compile workflow
-    app = build_djia_graph()
-
     # Track workflow steps để debugging/logging
     workflow_steps = []
 
@@ -223,7 +187,7 @@ def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
     initial_state = {"question": question}
     if force_chart:
         initial_state["force_chart"] = True
-    result = app.invoke(initial_state)
+    result = APP.invoke(initial_state)
 
     # ========== TRACK WORKFLOW STEPS ==========
 
@@ -266,7 +230,6 @@ def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
         return {
             "success": True,
             "sql": None,
-            "actual_sql": None,
             "df": None,
             "answer": result.get("answer", ""),
             "used_sample": False,
@@ -309,7 +272,7 @@ def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
             {
                 "step": len(workflow_steps) + 1,
                 "node": "generate_sql",
-                "description": "Sinh SQL bằng Gemini AI",
+                "description": "Sinh SQL bằng LLM",
                 "status": "completed",
                 "result": "SQL được sinh tự động bởi LLM",
             }
@@ -365,7 +328,6 @@ def run_djia_graph(question: str, force_chart: bool = False) -> Dict[str, Any]:
     return {
         "success": success,  # Workflow thành công?
         "sql": result.get("actual_sql", result.get("sql", "")),  # SQL đã thực thi
-        "actual_sql": result.get("actual_sql", result.get("sql", "")),
         "df": result.get("df"),  # DataFrame kết quả
         "answer": result.get("answer", ""),  # Câu trả lời tự nhiên
         "used_sample": result.get("used_sample", False),  # Có dùng SQL mẫu?

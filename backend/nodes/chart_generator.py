@@ -1,18 +1,13 @@
-from typing import Dict, Any, Optional, List
-import json
-import os
+from typing import Dict, Any, Optional
 
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.express as px
-import psycopg2
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
-from google import generativeai as google_genai
 
-from config import DB_CONNECTION_STRING
+from nodes.llm import ask
+from nodes.sql_executor import run_sql
 from nodes.utils import (
     extract_ticker,
     extract_date_range,
@@ -20,362 +15,22 @@ from nodes.utils import (
     normalize_text,
 )
 
-load_dotenv()
-if os.getenv("GOOGLE_API_KEY") in (None, "") and os.getenv("GEMINI_API_KEY"):
-    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
-
-
-def _required_columns_for_chart(chart_type: Optional[str]) -> List[str]:
-    mapping = {
-        "candlestick": ["date", "open", "high", "low", "close", "volume"],
-        "volume": ["date", "open", "close", "volume"],
-        "comparison": ["date", "ticker", "close"],
-    }
-    return mapping.get(chart_type, ["date", "close", "volume"])
-
-
-def _prepare_data_preview(df: pd.DataFrame, max_rows: int = 60) -> List[Dict[str, Any]]:
-    """Chuẩn bị preview của DataFrame để gửi cho LLM, convert tất cả Timestamp và các kiểu không JSON serializable."""
-    preview = df.head(max_rows).copy()
-    for col in preview.columns:
-        # Convert datetime/Timestamp sang string
-        if pd.api.types.is_datetime64_any_dtype(preview[col]):
-            preview[col] = preview[col].dt.strftime("%Y-%m-%d")
-        # Convert các giá trị Timestamp lẻ (nếu có)
-        elif preview[col].dtype == "object":
-            # Kiểm tra nếu có Timestamp objects
-            preview[col] = preview[col].apply(
-                lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp) else x
-            )
-        # Convert NaN/None thành None (JSON serializable)
-        preview[col] = preview[col].where(pd.notna(preview[col]), None)
-
-    # Convert sang dict và xử lý các giá trị không serializable
-    records = preview.to_dict(orient="records")
-    # Đảm bảo tất cả giá trị đều JSON serializable
-    for record in records:
-        for key, value in record.items():
-            if isinstance(value, pd.Timestamp):
-                record[key] = value.strftime("%Y-%m-%d")
-            elif pd.isna(value):
-                record[key] = None
-            elif isinstance(value, (np.integer, np.floating)):
-                record[key] = (
-                    float(value) if isinstance(value, np.floating) else int(value)
-                )
-    return records
-
-
-def build_chart_sql(
-    question: str,
-    chart_type: Optional[str],
-    chart_request: Optional[Dict[str, Any]],
-    ticker: Optional[str],
-) -> Optional[str]:
-    """
-    Sinh SQL bằng LLM để lấy dữ liệu vẽ biểu đồ.
-    Trả về None nếu không thể sinh được.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        return None
-
-    google_genai.configure(api_key=api_key)
-    required_cols = ", ".join(_required_columns_for_chart(chart_type))
-    chart_request_json = json.dumps(chart_request or {}, ensure_ascii=False)
-    ticker_hint = ticker or "unknown"
-
-    # Schema
-    schema = (
-        "=== DATASET SCHEMA ===\n"
-        "Table: prices\n"
-        "  Columns: date (TEXT, YYYY-MM-DD), open, high, low, close, volume, dividends, stock_splits, ticker\n"
-        "  Note: prices.ticker joins with companies.symbol\n\n"
-        "Table: companies\n"
-        "  Columns: symbol (TEXT, primary key), name, sector, industry, market_cap, pe_ratio, ...\n"
-        "  Note: companies.symbol is the primary key\n\n"
-        "⚠️ KHÔNG tồn tại bảng 'stock_prices'. CHỈ dùng 'prices' và 'companies'.\n\n"
-    )
-
-    # Constraints
-    constraints = (
-        "=== QUY TẮC QUAN TRỌNG CHO VISUALIZATION ===\n"
-        "1. Khi câu hỏi yêu cầu 'per company', 'each company', 'for each DJIA company':\n"
-        "   → PHẢI GROUP BY ticker hoặc symbol (KHÔNG BAO GIỜ GROUP BY date)\n"
-        "   → Mỗi dòng kết quả = một công ty\n\n"
-        "2. Nếu câu hỏi liên quan đến toàn năm (in 2024, during 2024):\n"
-        "   → Phải aggregate toàn bộ năm (AVG, SUM, COUNT cho cả năm)\n"
-        "   → KHÔNG GROUP BY date (trừ khi user nói rõ 'per day')\n\n"
-        "3. Scatter plot/correlation chart:\n"
-        "   → Mỗi điểm = một company → GROUP BY ticker\n"
-        "   → Trừ khi user nói 'per day' → GROUP BY date\n\n"
-        "4. Bar chart:\n"
-        "   → Một bar = một entity duy nhất (company hoặc day)\n"
-        "   → Nếu 'per company' → GROUP BY ticker\n\n"
-        "5. Pie chart:\n"
-        "   → Một slice = một category (sector, industry...)\n"
-        "   → GROUP BY category đó (sector, industry...)\n\n"
-        "6. Không được include columns không trong GROUP BY trừ khi chúng được aggregate.\n\n"
-    )
-
-    # Examples
-    examples = (
-        "=== VÍ DỤ ĐÚNG (Few-shot Examples) ===\n\n"
-        "Example 1: Scatter plot market cap vs P/E for all companies\n"
-        "SQL: SELECT symbol, name, market_cap, pe_ratio FROM companies;\n\n"
-        "Example 2: Pie chart distribution by sector\n"
-        "SQL: SELECT sector, COUNT(*) as count FROM companies GROUP BY sector;\n\n"
-        "Example 3: Bar chart total dividends per company in 2024\n"
-        "SQL: SELECT p.ticker, c.name, SUM(p.dividends) as total_dividends FROM prices p JOIN companies c ON p.ticker = c.symbol WHERE EXTRACT(YEAR FROM p.date) = 2024 GROUP BY p.ticker;\n\n"
-        "Example 4: Scatter plot average volume vs average price per company in 2024\n"
-        "SQL: SELECT p.ticker, c.name, AVG(p.volume) as avg_volume, AVG(p.close) as avg_close FROM prices p JOIN companies c ON p.ticker = c.symbol WHERE EXTRACT(YEAR FROM p.date) = 2024 GROUP BY p.ticker;\n\n"
-        "❌ SAI: GROUP BY date khi câu hỏi về 'per company'\n"
-        "❌ SAI: Không GROUP BY khi cần aggregate per company\n\n"
-    )
-
-    system_prompt = (
-        "Bạn là trợ lý SQL cho PostgreSQL nhằm chuẩn bị dữ liệu vẽ biểu đồ tài chính.\n"
-        "Luôn trả về một câu SELECT thuần, không markdown, không comment, không giải thích.\n"
-    )
-
-    guidance = (
-        "=== QUY TẮC CHUNG ===\n"
-        "- CHỈ sử dụng bảng prices và companies.\n"
-        "- Nếu biết ticker, dùng WHERE prices.ticker = :ticker.\n"
-        "- Nếu có khoảng ngày, dùng date(date) BETWEEN date(:start_date) AND date(:end_date).\n"
-        "- Nếu không có khoảng ngày, dùng CTE với LIMIT :window_days (ví dụ 180) cho dữ liệu gần nhất.\n"
-        "- Luôn ORDER BY date ASC (trừ khi GROUP BY ticker).\n"
-        "- Đối với comparison, phải trả về cột ticker và ít nhất hai công ty.\n"
-        "- Khi câu hỏi về 'all DJIA companies', 'each DJIA company', 'all companies':\n"
-        "  * PHẢI JOIN companies với prices: JOIN companies ON prices.ticker = companies.symbol\n"
-        "  * Trả về các cột: ticker (hoặc symbol), name (từ companies), sector, market_cap, pe_ratio, và các metrics từ prices\n"
-        "  * Nếu cần aggregate (avg, sum, count): dùng GROUP BY ticker hoặc symbol\n"
-        "- Không được tạo bảng mới hay sử dụng tên bảng khác.\n"
-        "- Không dùng comment hoặc nhiều câu SQL.\n"
-        "- ⚠️ QUAN TRỌNG: Khi JOIN companies với prices và cần filter theo tên công ty:\n"
-        "  * NẾU đã có parameter :ticker trong câu hỏi, PHẢI LUÔN dùng trực tiếp WHERE prices.ticker = :ticker hoặc WHERE companies.symbol = :ticker\n"
-        "  * KHÔNG BAO GIỜ tạo CTE để tìm ticker từ tên công ty nếu đã có :ticker sẵn!\n"
-        "  * CHỈ tạo CTE tìm ticker nếu câu hỏi KHÔNG có ticker và chỉ có tên công ty\n"
-        "  * Nếu chỉ biết tên công ty (KHÔNG có :ticker): PHẢI dùng WHERE companies.name ILIKE '%' || :company || '%' (KHÔNG dùng WHERE companies.name = :company hoặc WHERE companies.name = 'literal')\n"
-        "  * Lý do: Tên công ty trong database là 'Apple Inc.' hoặc 'Apple, Inc.' chứ không phải chỉ 'Apple'\n"
-        "  * → name = 'Apple' sẽ KHÔNG BAO GIỜ match được, kết quả luôn trả về 0 dòng!\n"
-        "  * Ví dụ đúng (có :ticker): SELECT ... FROM prices WHERE ticker = :ticker AND EXTRACT(YEAR FROM date) = :year;\n"
-        "  * Ví dụ SAI (có :ticker nhưng vẫn tạo CTE): WITH company_ticker AS (SELECT symbol FROM companies WHERE name ILIKE '%' || :company || '%') SELECT ... FROM prices p JOIN company_ticker ct ON p.ticker = ct.symbol;\n"
-        "  * Ví dụ đúng (chỉ có tên công ty, không có :ticker): SELECT ... FROM prices p JOIN companies c ON p.ticker = c.symbol WHERE c.name ILIKE '%' || :company || '%';\n"
-        "  * Ví dụ sai: SELECT ... FROM prices p JOIN companies c ON p.ticker = c.symbol WHERE c.name = 'Apple';\n"
-        "- ⚠️ QUAN TRỌNG: Tên parameter phải đúng:\n"
-        "  * Dùng :company (KHÔNG dùng :company_name)\n"
-        "  * Dùng :ticker (KHÔNG dùng :ticker_symbol hoặc :symbol)\n"
-        "  * Các parameter khác: :date, :year, :month, :quarter, :start_date, :end_date\n"
-        "- ⚠️ QUAN TRỌNG: Khi dùng LAG() để tính daily return hoặc price change:\n"
-        "  * KHÔNG BAO GIỜ dùng default value là chính giá trị hiện tại (ví dụ: LAG(close, 1, close))\n"
-        "  * Lý do: Ngày đầu tiên sẽ có LAG = close, dẫn đến close - close = 0 (SAI)\n"
-        "  * Giải pháp đúng: Dùng LAG(close, 1) (không có default) hoặc LAG(close, 1, NULL)\n"
-        "  * Sau đó filter ra các dòng NULL: WHERE LAG(close, 1) IS NOT NULL\n"
-        "  * Hoặc dùng CASE WHEN: CASE WHEN LAG(close, 1) IS NULL THEN NULL ELSE (close - LAG(close, 1)) / LAG(close, 1) * 100 END\n"
-        "  * Ví dụ đúng: SELECT date, (close - LAG(close, 1) OVER (ORDER BY date)) / LAG(close, 1) OVER (ORDER BY date) * 100 AS daily_return FROM prices WHERE ticker = :ticker AND LAG(close, 1) OVER (ORDER BY date) IS NOT NULL\n"
-    )
-
-    prompt = (
-        f"{system_prompt}\n\n"
-        f"{schema}\n"
-        f"{constraints}\n"
-        f"{examples}\n"
-        f"{guidance}\n\n"
-        f"=== THÔNG TIN CÂU HỎI ===\n"
-        f"Câu hỏi: {question}\n"
-        f"Loại biểu đồ (gợi ý): {chart_type or 'auto'}\n"
-        f"Yêu cầu chart JSON: {chart_request_json}\n"
-        f"Ticker chính (nếu có): {ticker_hint}\n"
-        f"Cần tối thiểu các cột: {required_cols}\n\n"
-        f"SQL:"
-    )
-
-    try:
-        model = google_genai.GenerativeModel("gemini-2.5-flash")
-        resp = model.generate_content(prompt)
-        sql = (resp.text or "").strip()
-
-        if sql.startswith("```"):
-            lines = sql.split("\n")
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            sql = "\n".join(lines).strip()
-
-        # Bỏ mọi phần text/Reasoning đứng trước câu lệnh SQL
-        first_sql_match = re.search(
-            r"\b(WITH|SELECT|INSERT|UPDATE|DELETE)\b", sql, re.IGNORECASE
-        )
-        if first_sql_match:
-            sql = sql[first_sql_match.start() :].strip()
-
-        if sql and not sql.endswith(";"):
-            sql += ";"
-
-        # Post-processing: Convert SQLite syntax sang PostgreSQL syntax
-        # Chuyển strftime() thành EXTRACT() hoặc TO_CHAR()
-        # Xử lý tất cả các pattern: strftime('%Y', date), strftime('%%Y', date), strftime('%%%Y', date), etc.
-        # strftime('%Y', date) hoặc strftime('%%Y', date) -> EXTRACT(YEAR FROM date)
-        sql = re.sub(
-            r"strftime\s*\(\s*'%+Y'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-            r"EXTRACT(YEAR FROM \1)",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # strftime('%m', date) hoặc strftime('%%m', date) -> EXTRACT(MONTH FROM date)
-        sql = re.sub(
-            r"strftime\s*\(\s*'%+m'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-            r"EXTRACT(MONTH FROM \1)",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # strftime('%d', date) hoặc strftime('%%d', date) -> EXTRACT(DAY FROM date)
-        sql = re.sub(
-            r"strftime\s*\(\s*'%+d'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-            r"EXTRACT(DAY FROM \1)",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # strftime('%Y-%m-%d', date) -> TO_CHAR(date, 'YYYY-MM-DD')
-        sql = re.sub(
-            r"strftime\s*\(\s*'%+Y-%+m-%+d'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-            r"TO_CHAR(\1, 'YYYY-MM-DD')",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # strftime('%W', date) -> EXTRACT(WEEK FROM date)
-        sql = re.sub(
-            r"strftime\s*\(\s*'%+W'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-            r"EXTRACT(WEEK FROM \1)",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # Xử lý trường hợp so sánh: strftime('%%Y', date) = '2024' -> EXTRACT(YEAR FROM date) = 2024
-        # Loại bỏ dấu nháy đơn quanh số năm nếu có
-        sql = re.sub(
-            r"EXTRACT\(YEAR FROM ([a-zA-Z_][a-zA-Z0-9_.]*)\)\s*=\s*'(\d{4})'",
-            r"EXTRACT(YEAR FROM \1) = \2",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        
-        # Post-processing: Sửa WHERE companies.name = 'literal' thành WHERE companies.name ILIKE '%literal%'
-        # Áp dụng cho TẤT CẢ các trường hợp
-        # Lý do: Tên công ty trong database là "Apple Inc." chứ không phải "Apple", nên name = 'Apple' sẽ không match
-        
-        # Sửa WHERE companies.name = 'literal' thành WHERE companies.name ILIKE '%literal%'
-        sql = re.sub(
-            r"WHERE\s+companies\.name\s*=\s*'([^']+)'",
-            r"WHERE companies.name ILIKE '%' || '\1' || '%'",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # Sửa WHERE c.name = 'literal' thành WHERE c.name ILIKE '%literal%' (khi có alias c)
-        sql = re.sub(
-            r"WHERE\s+([a-zA-Z_][a-zA-Z0-9_]*)\.name\s*=\s*'([^']+)'",
-            lambda m: f"WHERE {m.group(1)}.name ILIKE '%' || '{m.group(2)}' || '%'" if m.group(1).lower() in ['c', 'companies', 'company'] else m.group(0),
-            sql,
-            flags=re.IGNORECASE,
-        )
-        # Sửa WHERE name = 'literal' khi đang query từ companies (SELECT ... FROM companies WHERE name = ...)
-        if re.search(r"FROM\s+companies", sql, re.IGNORECASE) and not re.search(r"WHERE\s+companies\.name|WHERE\s+[a-zA-Z_]\.name", sql, re.IGNORECASE):
-            sql = re.sub(
-                r"WHERE\s+name\s*=\s*'([^']+)'",
-                r"WHERE name ILIKE '%' || '\1' || '%'",
-                sql,
-                flags=re.IGNORECASE,
-            )
-        
-        # Post-processing: Sửa :company_name thành :company (tên parameter sai)
-        sql = re.sub(
-            r":company_name\b",
-            r":company",
-            sql,
-            flags=re.IGNORECASE,
-        )
-        
-        # Post-processing: Loại bỏ CTE tìm ticker nếu SQL đã có :ticker
-        # Pattern: WITH company_ticker AS (SELECT symbol FROM companies WHERE name ILIKE ...) ... JOIN company_ticker
-        # Nếu SQL có :ticker thì thay thế bằng WHERE ticker = :ticker trực tiếp
-        if re.search(r":ticker\b", sql, re.IGNORECASE):
-            # Tìm và loại bỏ CTE tìm ticker
-            # Pattern: WITH company_ticker AS (SELECT symbol FROM companies WHERE name ILIKE '%' || :company || '%'), ... JOIN company_ticker ct ON ...
-            cte_pattern = r"WITH\s+company_ticker\s+AS\s*\(\s*SELECT\s+symbol\s+FROM\s+companies\s+WHERE\s+name\s+ILIKE\s+'%%'\s*\|\|\s*:company\s*\|\|\s*'%%'\s*\)\s*,?\s*"
-            if re.search(cte_pattern, sql, re.IGNORECASE):
-                # Loại bỏ CTE
-                sql = re.sub(cte_pattern, "", sql, flags=re.IGNORECASE)
-                # Thay thế JOIN company_ticker ct ON p.ticker = ct.symbol thành WHERE p.ticker = :ticker
-                sql = re.sub(
-                    r"JOIN\s+company_ticker\s+[a-zA-Z_]*\s+ON\s+[a-zA-Z_]*\.ticker\s*=\s*[a-zA-Z_]*\.symbol",
-                    "",
-                    sql,
-                    flags=re.IGNORECASE,
-                )
-                # Thêm WHERE ticker = :ticker nếu chưa có WHERE
-                if not re.search(r"WHERE\s+.*ticker\s*=", sql, re.IGNORECASE):
-                    # Tìm vị trí sau FROM prices hoặc sau JOIN companies
-                    if re.search(r"FROM\s+prices", sql, re.IGNORECASE):
-                        sql = re.sub(
-                            r"(FROM\s+prices(?:\s+[a-zA-Z_]+)?)",
-                            r"\1 WHERE ticker = :ticker",
-                            sql,
-                            flags=re.IGNORECASE,
-                            count=1,
-                        )
-                    elif re.search(r"JOIN\s+companies", sql, re.IGNORECASE):
-                        # Nếu có JOIN companies, thêm WHERE sau JOIN
-                        sql = re.sub(
-                            r"(JOIN\s+companies(?:\s+[a-zA-Z_]+)?\s+ON\s+[^W]+)",
-                            r"\1 WHERE prices.ticker = :ticker",
-                            sql,
-                            flags=re.IGNORECASE,
-                            count=1,
-                        )
-
-        return sql or None
-    except Exception as e:
-        print(f"Error generating chart SQL with LLM: {e}")
-        return None
-
 
 def build_chart_code(
-    question: str,
-    chart_type_hint: Optional[str],
-    chart_request: Optional[Dict[str, Any]],
-    df: pd.DataFrame,
+    question: str, chart_type_hint: Optional[str], df: pd.DataFrame
 ) -> Optional[str]:
     """
     Yêu cầu LLM sinh code Plotly để dựng biểu đồ trực tiếp từ DataFrame df.
     """
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key or df is None or df.empty:
+    if df is None or df.empty:
         return None
 
-    google_genai.configure(api_key=api_key)
-    preview = _prepare_data_preview(df)
+    # 60 dòng đầu làm dữ liệu mẫu cho LLM (ngày ở dạng YYYY-MM-DD)
+    preview = df.head(60).copy()
+    for col in preview.select_dtypes("datetime").columns:
+        preview[col] = preview[col].dt.strftime("%Y-%m-%d")
+    data_json = preview.to_json(orient="records", force_ascii=False, default_handler=str)
     columns = ", ".join(df.columns.tolist())
-    chart_request_json = json.dumps(chart_request or {}, ensure_ascii=False)
-
-    # Tạo data_json với error handling
-    try:
-        data_json = json.dumps(preview, ensure_ascii=False, default=str)
-    except Exception as e:
-        # Nếu vẫn lỗi, thử convert lại tất cả giá trị
-        print(f"Warning: Error serializing preview data: {e}")
-        # Convert tất cả giá trị không serializable sang string
-        safe_preview = []
-        for record in preview:
-            safe_record = {}
-            for key, value in record.items():
-                try:
-                    json.dumps(value)  # Test serialization
-                    safe_record[key] = value
-                except (TypeError, ValueError):
-                    safe_record[key] = str(value) if value is not None else None
-            safe_preview.append(safe_record)
-        data_json = json.dumps(safe_preview, ensure_ascii=False)
 
     system_prompt = (
         "Bạn là trợ lý dựng biểu đồ Plotly bằng Python. "
@@ -530,16 +185,13 @@ def build_chart_code(
         f"=== THÔNG TIN CÂU HỎI VÀ DỮ LIỆU ===\n"
         f"Câu hỏi: {question}\n"
         f"Chart type hint: {chart_type_hint or 'auto'}\n"
-        f"Chart request JSON: {chart_request_json}\n"
         f"Các cột sẵn có trong df: {columns}\n"
         f"Dữ liệu mẫu (JSON, {len(preview)} dòng đầu):\n{data_json}\n\n"
         f"Hãy sinh code Python để tạo biểu đồ Plotly phù hợp với câu hỏi và dữ liệu trên."
     )
 
     try:
-        model = google_genai.GenerativeModel("gemini-2.5-flash")
-        resp = model.generate_content(prompt)
-        code = (resp.text or "").strip()
+        code = ask(prompt)
         if code.startswith("```"):
             parts = code.split("```")
             code = parts[1] if len(parts) > 1 else code
@@ -594,67 +246,43 @@ def render_chart_from_code(
 
 
 def fetch_chart_data(question: str, ticker: str, chart_type: str) -> pd.DataFrame:
-    """Lấy dữ liệu từ database để vẽ biểu đồ."""
-    engine = create_engine(DB_CONNECTION_STRING)
-
-    try:
-        # Xác định khoảng thời gian
+    """Fallback khi SQL của agent không trả về dòng nào: lấy thẳng giá từ bảng prices để vẽ."""
+    params: Dict[str, Any] = {}
+    if chart_type == "comparison":
+        # Tất cả công ty trong 1 tháng gần nhất có dữ liệu
+        sql = """
+            SELECT date, ticker, open, high, low, close, volume
+            FROM prices
+            WHERE date >= (SELECT MAX(date) FROM prices) - INTERVAL '1 month'
+            ORDER BY date ASC, ticker ASC
+        """
+    else:
         start_date, end_date = extract_date_range(question)
         date_parts = extract_date_parts(question)
-
-        # Xây dựng SQL query (PostgreSQL syntax)
-        if chart_type == "comparison":
-            # So sánh nhiều công ty - cần tìm tất cả tickers trong câu hỏi
-            # Fallback: lấy tất cả công ty trong 1 tháng gần nhất
-            sql = """
-                SELECT date, ticker, open, high, low, close, volume
-                FROM prices
-                WHERE date >= CURRENT_DATE - INTERVAL '1 month'
-                ORDER BY date ASC, ticker ASC
-            """
+        params["ticker"] = ticker
+        if start_date and end_date:
+            where = "date BETWEEN CAST(:start_date AS DATE) AND CAST(:end_date AS DATE)"
+            params.update(start_date=start_date, end_date=end_date)
+        elif "year" in date_parts:
+            where = "EXTRACT(YEAR FROM date) = :year"
+            params["year"] = int(date_parts["year"])
+            if "month" in date_parts:
+                where += " AND EXTRACT(MONTH FROM date) = :month"
+                params["month"] = int(date_parts["month"])
         else:
-            # Single ticker
-            where_clauses = [f"ticker = '{ticker}'"]
-
-            if start_date and end_date:
-                where_clauses.append(
-                    f"date BETWEEN '{start_date}'::date AND '{end_date}'::date"
-                )
-            elif "year" in date_parts:
-                where_clauses.append(f"EXTRACT(YEAR FROM date) = {date_parts['year']}")
-            elif "month" in date_parts and "year" in date_parts:
-                where_clauses.append(
-                    f"EXTRACT(YEAR FROM date) = {date_parts['year']} AND EXTRACT(MONTH FROM date) = {date_parts['month']}"
-                )
-            else:
-                # Default: last 3 months
-                where_clauses.append("date >= CURRENT_DATE - INTERVAL '3 months'")
-
-            where_clause = " AND ".join(where_clauses)
-
-            sql = f"""
-                SELECT date, open, high, low, close, volume
-                FROM prices
-                WHERE {where_clause}
-                ORDER BY date ASC
-            """
-
-        with engine.connect() as conn:
-            df = pd.read_sql_query(text(sql), conn)
-
-        # Convert date to datetime (PostgreSQL trả về date object)
-        if not df.empty and "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
-
-        return df
+            # Mặc định: 3 tháng gần nhất có dữ liệu
+            where = "date >= (SELECT MAX(date) FROM prices) - INTERVAL '3 months'"
+        sql = f"""
+            SELECT date, open, high, low, close, volume
+            FROM prices
+            WHERE ticker = :ticker AND {where}
+            ORDER BY date ASC
+        """
+    try:
+        return run_sql(sql, params)[0]
     except Exception as e:
         print(f"Error fetching chart data: {e}")
-        import traceback
-
-        traceback.print_exc()
         return pd.DataFrame()
-    finally:
-        engine.dispose()
 
 
 def generate_chart(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -663,7 +291,6 @@ def generate_chart(state: Dict[str, Any]) -> Dict[str, Any]:
     ticker = state.get("ticker")
     needs_chart = state.get("needs_chart", False)
     chart_type = state.get("chart_type", "line")
-    chart_request = state.get("chart_request")
     df = state.get("df")
 
     if not needs_chart:
@@ -733,7 +360,7 @@ def generate_chart(state: Dict[str, Any]) -> Dict[str, Any]:
     chart = None
     error_msg = None
     try:
-        code = build_chart_code(question, chart_type, chart_request, df)
+        code = build_chart_code(question, chart_type, df)
         if not code:
             error_msg = "LLM không thể sinh code Python để vẽ biểu đồ."
         else:

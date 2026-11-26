@@ -1,46 +1,10 @@
-from typing import Dict, Any, Optional
-import os
+from typing import Dict, Any
 import re
-from google import generativeai as google_genai
-from dotenv import load_dotenv
 
-load_dotenv()
-if os.getenv("GOOGLE_API_KEY") in (None, "") and os.getenv("GEMINI_API_KEY"):
-    os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
-
-HINT_GUIDANCE = {
-    "std_dev": "Tính độ lệch chuẩn bằng cách dùng STDDEV_POP(close) hoặc STDDEV_SAMP(close) trong PostgreSQL.",
-    "moving_average": "Dùng window function (AVG(close) OVER (PARTITION BY ticker ORDER BY date ROWS BETWEEN 29 PRECEDING AND CURRENT ROW)) để tính moving average theo số ngày yêu cầu.",
-    "cumulative_return": "Dùng CTE để lấy giá mở đầu và kết thúc rồi tính (end_price - start_price) / start_price * 100 dưới tên percentage_return.",
-    "days_count": "Đếm số phiên bằng COUNT(*) với điều kiện close lớn hơn/nhỏ hơn ngưỡng được nói trong câu hỏi.",
-    "days_percentage": "Tính COUNT(*) thỏa điều kiện rồi chia cho tổng số ngày * 100 để ra phần trăm.",
-    "ranking": "Sử dụng tổng lợi suất/return và ORDER BY DESC/ASC để xếp hạng; trả về TOP/LIMIT 3.",
-    "max_drawdown": "Tính drawdown bằng cách so sánh mỗi giá với đỉnh trước đó (window MAX) rồi chọn drawdown tối đa.",
-    "daily_return": "Tính daily return bằng LAG(close, 1) OVER (ORDER BY date) (KHÔNG dùng default value như LAG(close, 1, close)). Công thức: (close - LAG(close, 1)) / LAG(close, 1) * 100. Lưu ý: Filter ra các dòng NULL từ LAG hoặc dùng CASE WHEN để xử lý ngày đầu tiên.",
-    "price_change": "Tính price change bằng LAG(close, 1) OVER (ORDER BY date) (KHÔNG dùng default value như LAG(close, 1, close)). Công thức: close - LAG(close, 1). Lưu ý: Filter ra các dòng NULL từ LAG hoặc dùng CASE WHEN để xử lý ngày đầu tiên.",
-    "correlation": "Tính daily returns cho hai ticker bằng CTE với LAG(close, 1) (KHÔNG dùng default value), sau đó dùng công thức corr = (AVG(x*y) - AVG(x)*AVG(y)) / (STD_x * STD_y). Lưu ý: Filter ra các dòng NULL từ LAG.",
-    "beta": "Tính daily returns bằng LAG(close, 1) (KHÔNG dùng default value) và dùng công thức beta = COV(stock, index) / VAR(index). Lưu ý: Filter ra các dòng NULL từ LAG.",
-    "sharpe_ratio": "Tính daily returns bằng LAG(close, 1) (KHÔNG dùng default value), annualize trung bình và độ lệch chuẩn, rồi áp dụng (avg_return - risk_free_rate)/std_dev. Lưu ý: Filter ra các dòng NULL từ LAG.",
-    "single_day_drop": "Tính phần trăm thay đổi mỗi ngày ((close-open)/open*100) và chọn giá trị âm thấp nhất.",
-    "single_day_gain": "Tương tự nhưng chọn giá trị cao nhất.",
-}
+from nodes.llm import ask
 
 
-def _build_hint_text(analysis_hint: Optional[str]) -> str:
-    if not analysis_hint:
-        return ""
-    guidance = HINT_GUIDANCE.get(analysis_hint)
-    if guidance:
-        return f"\nYÊU CẦU NÂNG CAO: {guidance}"
-    return f"\nYÊU CẦU NÂNG CAO: Hãy dùng CTE và các phép tính cần thiết để xử lý loại câu hỏi '{analysis_hint}'."
-
-
-def generate_sql_with_llm(
-    question: str, feedback: Optional[str] = None, analysis_hint: Optional[str] = None
-) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    google_genai.configure(api_key=api_key)
-
+def generate_sql_with_llm(question: str) -> str:
     # Dataset Schema
     schema = (
         "=== DATASET SCHEMA ===\n"
@@ -107,12 +71,15 @@ def generate_sql_with_llm(
         f"{examples}"
         "=== QUY TẮC CHUNG ===\n"
         "- Trả về CHỈ SQL thuần túy, KHÔNG thêm markdown (```sql), giải thích hay comment.\n"
-        "- Dùng tham số kiểu :ticker, :date, :year, :month, :quarter nếu phù hợp.\n"
-        "- So sánh ngày: date = CAST(:date AS DATE) hoặc date::date = :date::date\n"
+        "- Dùng tham số kiểu :ticker, :date, :year, :month, :quarter nếu phù hợp. KHÔNG tự đặt tham số khác.\n"
+        "- Bảng companies chỉ chứa 30 công ty DJIA: hỏi về toàn bộ DJIA thì truy vấn cả bảng, KHÔNG lọc theo danh sách mã tự liệt kê.\n"
+        "- So sánh ngày: date = CAST(:date AS DATE). KHÔNG viết :date::date (SQLAlchemy không bind được)\n"
         "- Lọc theo năm: TO_CHAR(date, 'YYYY') = :year hoặc EXTRACT(YEAR FROM date) = :year\n"
         "- Lọc theo tháng: TO_CHAR(date, 'MM') = :month hoặc EXTRACT(MONTH FROM date) = :month\n"
         "- ⚠️ QUAN TRỌNG: KHÔNG BAO GIỜ dùng strftime() - đây là SQLite syntax, PostgreSQL KHÔNG hỗ trợ!\n"
         "- ⚠️ QUAN TRỌNG: KHÔNG dùng LIKE cho date, dùng TO_CHAR() hoặc EXTRACT().\n"
+        "- ⚠️ PostgreSQL KHÔNG cho lồng window function (LAG, LEAD, ... OVER) trong aggregate (AVG, STDDEV, MAX...): "
+        "tính LAG/return trong CTE trước, rồi mới aggregate ở SELECT ngoài.\n"
         "- JOIN: prices.ticker = companies.symbol\n"
         "- ⚠️ QUAN TRỌNG: Khi truy vấn thông tin từ bảng companies (sector, country, industry, description, website, market_cap, pe_ratio, dividend_yield, week_52_high, week_52_low, etc.),\n"
         "  NẾU đã biết ticker (có parameter :ticker), PHẢI LUÔN dùng WHERE companies.symbol = :ticker (KHÔNG BAO GIỜ dùng WHERE companies.name = :company hoặc WHERE companies.name ILIKE).\n"
@@ -155,20 +122,7 @@ def generate_sql_with_llm(
         'Format: "Reasoning: [mô tả]. SQL: [câu lệnh SQL]"\n'
     )
 
-    hint_text = _build_hint_text(analysis_hint)
-    if feedback:
-        prompt_text = (
-            f"{system}{hint_text}\n\n"
-            f"Câu hỏi: {question}\n\n"
-            f"Lỗi khi chạy SQL trước đó: {feedback}\n"
-            f"Hãy sửa lại SQL theo đúng quy tắc trên."
-        )
-    else:
-        prompt_text = f"{system}{hint_text}\n\nCâu hỏi: {question}"
-
-    model = google_genai.GenerativeModel("gemini-2.5-flash")
-    resp = model.generate_content(prompt_text)
-    response_text = (resp.text or "").strip()
+    response_text = ask(f"{system}\n\nCâu hỏi: {question}")
 
     # Extract SQL từ response (có thể có reasoning trước)
     sql = response_text
@@ -205,40 +159,19 @@ def generate_sql_with_llm(
     if sql and not sql.endswith(";"):
         sql += ";"
 
-    # Post-processing: Convert SQLite syntax sang PostgreSQL syntax
-    # Chuyển strftime() thành EXTRACT() hoặc TO_CHAR()
-    # Xử lý tất cả các pattern: strftime('%Y', date), strftime('%%Y', date), strftime('%%%Y', date), etc.
-    # strftime('%Y', date) hoặc strftime('%%Y', date) -> EXTRACT(YEAR FROM date)
+    # Post-processing: LLM đôi khi viết cú pháp SQLite -> đổi sang PostgreSQL
+    # strftime('%Y', date) -> EXTRACT(YEAR FROM date), tương tự cho tháng/ngày/tuần
+    ident = r"([a-zA-Z_][a-zA-Z0-9_.]*)"
+    for fmt, part in (("Y", "YEAR"), ("m", "MONTH"), ("d", "DAY"), ("W", "WEEK")):
+        sql = re.sub(
+            rf"strftime\s*\(\s*'%+{fmt}'\s*,\s*{ident}\s*\)",
+            rf"EXTRACT({part} FROM \1)",
+            sql,
+            flags=re.IGNORECASE,
+        )
+    # strftime('%Y-%m-%d', date) -> TO_CHAR(date, 'YYYY-MM-DD')
     sql = re.sub(
-        r"strftime\s*\(\s*'%+Y'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-        r"EXTRACT(YEAR FROM \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # strftime('%m', date) hoặc strftime('%%m', date) -> EXTRACT(MONTH FROM date)
-    sql = re.sub(
-        r"strftime\s*\(\s*'%+m'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-        r"EXTRACT(MONTH FROM \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # strftime('%d', date) hoặc strftime('%%d', date) -> EXTRACT(DAY FROM date)
-    sql = re.sub(
-        r"strftime\s*\(\s*'%+d'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-        r"EXTRACT(DAY FROM \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # strftime('%W', date) hoặc strftime('%%W', date) -> EXTRACT(WEEK FROM date)
-    sql = re.sub(
-        r"strftime\s*\(\s*'%+W'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
-        r"EXTRACT(WEEK FROM \1)",
-        sql,
-        flags=re.IGNORECASE,
-    )
-    # strftime('%Y-%m-%d', date) hoặc strftime('%%Y-%%m-%%d', date) -> TO_CHAR(date, 'YYYY-MM-DD')
-    sql = re.sub(
-        r"strftime\s*\(\s*'%+Y-%+m-%+d'\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)",
+        rf"strftime\s*\(\s*'%+Y-%+m-%+d'\s*,\s*{ident}\s*\)",
         r"TO_CHAR(\1, 'YYYY-MM-DD')",
         sql,
         flags=re.IGNORECASE,
@@ -314,13 +247,6 @@ def generate_sql_with_llm(
     if re.search(metadata_fields_pattern, sql, re.IGNORECASE) and not re.search(
         r"SELECT\s+symbol\s+FROM\s+companies", sql, re.IGNORECASE
     ):
-        # Sửa WHERE name ILIKE '%' || :company || '%' thành WHERE symbol = :ticker
-        sql = re.sub(
-            r"WHERE\s+name\s+ILIKE\s+'%%'\s*\|\|\s*:company\s*\|\|\s*'%%'",
-            r"WHERE symbol = :ticker",
-            sql,
-            flags=re.IGNORECASE,
-        )
         # Sửa WHERE name = :company thành WHERE symbol = :ticker
         sql = re.sub(
             r"WHERE\s+name\s*=\s*:company\b",
@@ -344,53 +270,9 @@ def generate_sql_with_llm(
         flags=re.IGNORECASE,
     )
     
-    # Post-processing: Loại bỏ CTE tìm ticker nếu SQL đã có :ticker
-    # Pattern: WITH company_ticker AS (SELECT symbol FROM companies WHERE name ILIKE ...) ... JOIN company_ticker
-    # Nếu SQL có :ticker thì thay thế bằng WHERE ticker = :ticker trực tiếp
-    if re.search(r":ticker\b", sql, re.IGNORECASE):
-        # Tìm và loại bỏ CTE tìm ticker
-        # Pattern: WITH company_ticker AS (SELECT symbol FROM companies WHERE name ILIKE '%' || :company || '%'), ... JOIN company_ticker ct ON ...
-        cte_pattern = r"WITH\s+company_ticker\s+AS\s*\(\s*SELECT\s+symbol\s+FROM\s+companies\s+WHERE\s+name\s+ILIKE\s+'%%'\s*\|\|\s*:company\s*\|\|\s*'%%'\s*\)\s*,?\s*"
-        if re.search(cte_pattern, sql, re.IGNORECASE):
-            # Loại bỏ CTE
-            sql = re.sub(cte_pattern, "", sql, flags=re.IGNORECASE)
-            # Thay thế JOIN company_ticker ct ON p.ticker = ct.symbol thành WHERE p.ticker = :ticker
-            sql = re.sub(
-                r"JOIN\s+company_ticker\s+[a-zA-Z_]*\s+ON\s+[a-zA-Z_]*\.ticker\s*=\s*[a-zA-Z_]*\.symbol",
-                "",
-                sql,
-                flags=re.IGNORECASE,
-            )
-            # Thêm WHERE ticker = :ticker nếu chưa có WHERE
-            if not re.search(r"WHERE\s+.*ticker\s*=", sql, re.IGNORECASE):
-                # Tìm vị trí sau FROM prices hoặc sau JOIN companies
-                if re.search(r"FROM\s+prices", sql, re.IGNORECASE):
-                    sql = re.sub(
-                        r"(FROM\s+prices(?:\s+[a-zA-Z_]+)?)",
-                        r"\1 WHERE ticker = :ticker",
-                        sql,
-                        flags=re.IGNORECASE,
-                        count=1,
-                    )
-                elif re.search(r"JOIN\s+companies", sql, re.IGNORECASE):
-                    # Nếu có JOIN companies, thêm WHERE sau JOIN
-                    sql = re.sub(
-                        r"(JOIN\s+companies(?:\s+[a-zA-Z_]+)?\s+ON\s+[^W]+)",
-                        r"\1 WHERE prices.ticker = :ticker",
-                        sql,
-                        flags=re.IGNORECASE,
-                        count=1,
-                    )
-
     return sql
 
 
 def generate_sql(state: Dict[str, Any]) -> Dict[str, Any]:
-    question = state.get("question", "")
-    # Có thể dùng feedback từ vòng trước
-    feedback = state.get("feedback")
-    analysis_hint = state.get("analysis_hint")
-    sql = generate_sql_with_llm(
-        question, feedback=feedback, analysis_hint=analysis_hint
-    )
+    sql = generate_sql_with_llm(state.get("question", ""))
     return {**state, "sql": sql, "used_sample": False}
