@@ -179,6 +179,15 @@ def extract_date_parts(question: str) -> Dict[str, str]:
         month = f"{int(m.group(2)):02d}"
         year = m.group(3)
         return {"date": f"{year}-{month}-{day}", "year": year, "month": month}
+    # Tiếng Việt: "ngày 15 tháng 3 năm 2024"
+    m = re.search(r"ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s*(?:năm\s+|/)(\d{4})", q, re.I)
+    if m:
+        day, month, year = f"{int(m.group(1)):02d}", f"{int(m.group(2)):02d}", m.group(3)
+        return {"date": f"{year}-{month}-{day}", "year": year, "month": month}
+    # Tiếng Việt: "tháng 3 năm 2025", "tháng 3/2025"
+    m = re.search(r"tháng\s+(\d{1,2})\s*(?:năm\s+|/)(\d{4})", q, re.I)
+    if m:
+        return {"year": m.group(2), "month": f"{int(m.group(1)):02d}"}
     m = re.search(r"(20\d{2})", q)
     if m:
         return {"year": m.group(1)}
@@ -386,3 +395,12 @@ def extract_month_range(question: str) -> Tuple[Optional[str], Optional[str]]:
         if a_norm and b_norm:
             return a_norm, b_norm
     return None, None
+
+
+if __name__ == "__main__":
+    assert extract_date_parts("Giá đóng cửa trung bình của Apple trong tháng 3 năm 2025?") == {"year": "2025", "month": "03"}
+    assert extract_date_parts("giá tháng 11/2024") == {"year": "2024", "month": "11"}
+    assert extract_date_parts("Giá đóng cửa ngày 15 tháng 3 năm 2024") == {"date": "2024-03-15", "year": "2024", "month": "03"}
+    assert extract_date_parts("average close in March 2025") == {"year": "2025", "month": "03"}
+    assert extract_date_parts("năm 2025") == {"year": "2025"}
+    print("ok")

@@ -9,11 +9,42 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from graphs.djia_graph import run_djia_graph
+from nodes.llm import ask
 from nodes.sql_executor import run_sql
 from .models import Conversation, Message
 
 # CSRF cho /api/ đã tắt ở api.middleware, quyền mặc định là AllowAny (core/settings.py)
 User = get_user_model()
+
+
+def _standalone_question(question: str, history: Any) -> str:
+    """Viết lại câu hỏi nối tiếp thành câu đầy đủ dựa trên vài lượt hội thoại gần nhất.
+
+    Ví dụ: "Giá đóng cửa trung bình của Apple năm 2025?" rồi "riêng tháng 3 thôi"
+    -> "Giá đóng cửa trung bình của Apple trong tháng 3 năm 2025 là bao nhiêu?".
+    Không có lịch sử thì trả nguyên câu (không tốn lượt gọi LLM); LLM lỗi cũng trả nguyên câu.
+    """
+    # history do trình duyệt gửi lên: chỉ nhận list {role, content}, giới hạn 6 lượt x 1000 ký tự
+    turns = [
+        f"{'Người dùng' if h.get('role') == 'user' else 'Trợ lý'}: {str(h.get('content', ''))[:1000]}"
+        for h in (history if isinstance(history, list) else [])[-6:]
+        if isinstance(h, dict) and h.get("role") in ("user", "assistant") and h.get("content")
+    ]
+    if not turns:
+        return question
+    prompt = (
+        "Lịch sử hội thoại:\n" + "\n".join(turns) + f"\n\nCâu hỏi mới: {question}\n\n"
+        "Viết lại câu hỏi mới thành MỘT câu hỏi độc lập, đầy đủ thông tin (tên công ty, chỉ số, khoảng thời gian) "
+        "lấy từ lịch sử nếu câu hỏi mới đang nói tiếp. Giữ nguyên ngôn ngữ của câu hỏi mới. "
+        "Nếu câu hỏi mới đã đầy đủ hoặc không liên quan đến lịch sử, trả lại nguyên văn. "
+        "Chỉ trả về câu hỏi, không giải thích."
+    )
+    try:
+        rewritten = ask(prompt).strip().strip('"').strip()
+        return rewritten or question
+    except Exception as e:
+        print(f"Không viết lại được câu hỏi nối tiếp: {e}")
+        return question
 
 
 def _df_to_rows(df: pd.DataFrame, max_rows: int = 100) -> List[Dict[str, Any]]:
@@ -30,7 +61,8 @@ def djia_query(request):
     Nhận câu hỏi tự nhiên, chạy multi-agent DJIA và trả về kết quả JSON cho FE.
     Đã đăng nhập thì lưu hội thoại vào DB; chưa đăng nhập thì chỉ trả kết quả.
 
-    Body: { "question": "...", "force_chart": bool, "conversation_id": "uuid" }
+    Body: { "question": "...", "force_chart": bool, "conversation_id": "uuid",
+            "history": [{"role": "user"|"assistant", "content": "..."}] }  # history: vài lượt gần nhất, để hiểu câu hỏi nối tiếp
     """
     question = (request.data.get("question") or "").strip()
     if not question:
@@ -45,8 +77,11 @@ def djia_query(request):
             conversation = Conversation.objects.create(user=request.user, title=question[:80])
         Message.objects.create(conversation=conversation, role=Message.ROLE_USER, content=question)
 
+    # Câu hỏi nối tiếp ("riêng tháng 3 thôi") -> câu đầy đủ trước khi chạy agent
+    standalone = _standalone_question(question, request.data.get("history"))
+
     try:
-        result = run_djia_graph(question, force_chart=bool(request.data.get("force_chart")))
+        result = run_djia_graph(standalone, force_chart=bool(request.data.get("force_chart")))
     except Exception as e:
         error = f"Lỗi nội bộ khi chạy agent: {e}"
         if conversation:
@@ -73,6 +108,8 @@ def djia_query(request):
         "complexity": result.get("complexity", {}),
         "chart_json": chart_json,
         "conversation_id": str(conversation.id) if conversation else None,
+        # câu hỏi thực sự đã chạy (khác câu gốc khi đã ghép ngữ cảnh hội thoại)
+        "standalone_question": standalone if standalone != question else None,
     }
 
     if conversation:

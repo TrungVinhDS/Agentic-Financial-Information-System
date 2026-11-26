@@ -21,6 +21,7 @@ type Result = {
   chart_json?: string | null
   workflow?: Step[]
   open?: boolean // mở sẵn SQL + bảng (dùng cho chế độ SQL)
+  standalone_question?: string | null // câu hỏi đã ghép ngữ cảnh hội thoại
 }
 
 type ChatMessage = {
@@ -190,9 +191,10 @@ function Chart({ json }: { json: string }) {
 }
 
 function AssistantResult({ result }: { result: Result }) {
-  const { sql, rows = [], chart_json, workflow = [], used_sample, open } = result
+  const { sql, rows = [], chart_json, workflow = [], used_sample, open, standalone_question } = result
   return (
     <>
+      {standalone_question && <p className="hint">Đã hiểu câu hỏi là: “{standalone_question}”</p>}
       {workflow.length > 0 && (
         <Section title={`${workflow.length} bước xử lý của agent`}>
           <ol className="steps">
@@ -368,6 +370,8 @@ function App() {
           question: text,
           conversation_id: user && activeId ? activeId : undefined,
           force_chart: mode === 'chart',
+          // vài lượt gần nhất để backend hiểu câu hỏi nối tiếp ("riêng tháng 3 thôi")
+          history: messages.filter((m) => !m.code).slice(-6).map((m) => ({ role: m.role, content: m.content })),
         })
         reply = { id: `a-${stamp}`, role: 'assistant', content: data.answer, result: data }
 
