@@ -310,11 +310,11 @@ def build_params(
         if ":window_days" in sql_text:
             params["window_days"] = 180  # ~6 tháng
 
-    # ========== FALLBACK CHO :company ==========
-    # Các regex trên chỉ bắt được câu tiếng Anh ("X of Apple", "Apple stock"...).
-    # Đã biết ticker thì lấy tên chính thức trong bảng companies (AAPL -> "Apple Inc.")
-    # để SQL kiểu `name ILIKE '%' || :company || '%'` luôn khớp, kể cả câu tiếng Việt.
-    if "company" not in params and params.get("ticker"):
+    # ========== :company THEO TICKER ==========
+    # Các regex trên chỉ đoán tên công ty, hay sai (vd "Plot the closing price of Nvidia" -> "Plot the closing price")
+    # và không bắt được câu tiếng Việt. Đã biết ticker thì luôn dùng tên chính thức trong bảng companies
+    # (AAPL -> "Apple Inc.") để SQL kiểu `name ILIKE '%' || :company || '%'` luôn khớp; regex chỉ dùng khi không có ticker.
+    if params.get("ticker"):
         name = _company_name(params["ticker"])
         if name:
             params["company"] = name

@@ -379,4 +379,5 @@ def generate_chart(state: Dict[str, Any]) -> Dict[str, Any]:
             or "Không thể tạo biểu đồ từ mô tả của bạn. Hãy cụ thể hơn hoặc thử lại.",
         }
 
-    return {**state, "chart": chart, "chart_error": None}
+    # Trả df lại vào state: nếu phải tự fetch dữ liệu (SQL rỗng), câu trả lời sẽ dùng đúng dữ liệu đã vẽ
+    return {**state, "df": df, "chart": chart, "chart_error": None}
